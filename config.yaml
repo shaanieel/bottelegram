@@ -1,0 +1,51 @@
+app:
+  name: "ZAEIN Automation Bot"
+  timezone: "Asia/Riyadh"
+  max_parallel_downloads: 1
+  max_parallel_uploads: 1
+  auto_delete_after_upload: true
+  history_size: 50
+
+paths:
+  download_dir: "downloads"
+  log_dir: "logs"
+  temp_dir: "temp"
+  data_dir: "data"
+  jobs_file: "data/jobs.json"
+
+bunny:
+  library_id: "656273"
+  cdn_hostname: "vz-eaddacc6-5f8.b-cdn.net"
+  api_base: "https://video.bunnycdn.com"
+  request_timeout_seconds: 60
+  upload_timeout_seconds: 7200
+
+download:
+  default_tool: "auto"      # auto | gdown | ytdlp | direct
+  allow_direct_link: true
+  allow_google_drive: true
+  allow_ytdlp: true
+  max_file_size_gb: 20
+  request_timeout_seconds: 60
+  chunk_size_bytes: 1048576 # 1 MiB
+  user_agent: "Mozilla/5.0 (compatible; ZAEINBot/1.0)"
+
+upload_targets:
+  bunny_stream:
+    enabled: true
+  local_only:
+    enabled: true
+
+video_extensions:
+  - ".mp4"
+  - ".mkv"
+  - ".mov"
+  - ".avi"
+  - ".webm"
+  - ".m4v"
+
+logging:
+  level: "INFO"
+  max_bytes: 5242880   # 5 MiB
+  backup_count: 5
+  format: "%(asctime)s [%(levelname)s] %(name)s - %(message)s"

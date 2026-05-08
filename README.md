@@ -1,1 +1,457 @@
-# bottelegram
+# ZAEIN Automation Bot
+
+Bot Telegram automation untuk **download dari banyak sumber** lalu **upload ke
+Bunny Stream**, dengan **queue system**, log, retry, dan health-check.
+
+Dibuat agar mudah dijalankan di **Windows RDP** maupun **Linux VPS**, modular,
+aman, dan siap dipindah-pindah server.
+
+---
+
+## Daftar Isi
+
+1. [Fitur Utama](#fitur-utama)
+2. [Struktur Project](#struktur-project)
+3. [Persiapan: Install Python](#persiapan-install-python)
+4. [Persiapan: Install FFmpeg (opsional)](#persiapan-install-ffmpeg-opsional)
+5. [Buat Bot Telegram dari BotFather](#buat-bot-telegram-dari-botfather)
+6. [Ambil Telegram User ID Anda](#ambil-telegram-user-id-anda)
+7. [Ambil Bunny Stream API Key](#ambil-bunny-stream-api-key)
+8. [Install Dependency](#install-dependency)
+9. [Isi `.env` dan `config.yaml`](#isi-env-dan-configyaml)
+10. [Menjalankan Bot](#menjalankan-bot)
+11. [Daftar Command](#daftar-command)
+12. [Test Download dan Test Upload Bunny](#test-download-dan-test-upload-bunny)
+13. [Melihat Log](#melihat-log)
+14. [Memindahkan Server (VPS / RDP baru)](#memindahkan-server-vps--rdp-baru)
+15. [Backup Konfigurasi](#backup-konfigurasi)
+16. [Auto-start saat Startup](#auto-start-saat-startup)
+17. [Troubleshooting](#troubleshooting)
+18. [Keamanan](#keamanan)
+
+---
+
+## Fitur Utama
+
+- Download dari **Google Drive**, **Dropbox**, **OneDrive**, **direct link**, dan
+  **link yang didukung yt-dlp**.
+- Upload ke **Bunny Stream** menggunakan API resmi (create video, put binary,
+  cek status), tanpa hardcode API key.
+- **Queue system** async: kirim banyak job sekaligus, semua antri tertib.
+- **Persistensi job** ke `data/jobs.json` (anti hilang setelah restart).
+- **Cancel** dan **retry** per job.
+- **Auto-delete** file lokal setelah upload sukses (opsional).
+- **Health check** lengkap (internet, Bunny API, folder, FFmpeg, Python).
+- **Akses hanya admin**: bot menolak siapa pun yang bukan `ADMIN_TELEGRAM_ID`.
+- Log rotasi otomatis di `logs/bot.log`, **secrets selalu di-redaksi**.
+- **Cross-platform**: Windows + Linux, semua path relatif.
+- **Mudah dipindah server**: cukup copy folder, `.env`, `config.yaml`.
+
+---
+
+## Struktur Project
+
+```
+bottelegram/
+├── bot.py                     # Entrypoint
+├── config.yaml                # Konfigurasi non-rahasia
+├── .env.example               # Template untuk .env (rahasia)
+├── requirements.txt
+├── setup_windows.bat
+├── setup_linux.sh
+├── README.md
+├── .gitignore
+├── downloads/                 # File hasil download
+├── temp/                      # File sementara saat download
+├── logs/                      # Log bot (rotasi otomatis)
+├── data/
+│   └── jobs.json              # State antrean job (auto-generated)
+└── modules/
+    ├── __init__.py
+    ├── config_manager.py      # Load .env + config.yaml
+    ├── logger.py              # Rotating log + redaksi secret
+    ├── validators.py          # Klasifikasi URL, sanitasi nama file, dll
+    ├── storage_manager.py     # Disk stats, listing, delete
+    ├── downloader.py          # Google Drive / direct / yt-dlp
+    ├── bunny_uploader.py      # Bunny Stream API
+    ├── queue_manager.py       # Async queue + persistensi
+    └── telegram_handlers.py   # Semua command Telegram
+```
+
+> Semua path ditulis **relatif** terhadap root project. Tidak ada path lokal yang
+> di-hardcode.
+
+---
+
+## Persiapan: Install Python
+
+Bot ini butuh **Python 3.10+** (rekomendasi 3.11 / 3.12).
+
+### Windows
+
+1. Download dari <https://www.python.org/downloads/>.
+2. Saat install, **centang `Add Python to PATH`**.
+3. Verifikasi:
+   ```cmd
+   python --version
+   ```
+
+### Linux (Ubuntu / Debian)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip
+python3 --version
+```
+
+### Linux (RHEL / Fedora)
+
+```bash
+sudo dnf install -y python3 python3-pip
+```
+
+---
+
+## Persiapan: Install FFmpeg (opsional)
+
+FFmpeg dibutuhkan oleh **yt-dlp** untuk merge video + audio dari beberapa
+platform. **Tidak wajib** untuk Google Drive / direct link.
+
+### Windows
+
+1. Download dari <https://www.gyan.dev/ffmpeg/builds/> (release "essentials").
+2. Extract ke `C:\ffmpeg\`.
+3. Tambahkan `C:\ffmpeg\bin` ke environment variable `Path`.
+4. Verifikasi: `ffmpeg -version`.
+
+### Linux
+
+```bash
+sudo apt-get install -y ffmpeg     # Ubuntu / Debian
+sudo dnf install -y ffmpeg         # Fedora / RHEL
+ffmpeg -version
+```
+
+---
+
+## Buat Bot Telegram dari BotFather
+
+1. Buka Telegram, cari `@BotFather`.
+2. Kirim `/newbot`.
+3. Isi nama bot (boleh apa saja) dan username (harus diakhiri `bot`,
+   contoh `zaein_automation_bot`).
+4. BotFather akan memberi **token bot** (format
+   `123456789:ABCdef...`). **Simpan token ini**.
+5. (Opsional) Kirim `/setprivacy` -> pilih bot Anda -> pilih `Disable` jika ingin
+   bot membaca semua pesan grup.
+
+---
+
+## Ambil Telegram User ID Anda
+
+1. Buka Telegram, cari `@userinfobot`.
+2. Kirim `/start`.
+3. Bot akan membalas dengan `Id: 123456789`. Itulah `ADMIN_TELEGRAM_ID` Anda.
+4. Boleh isi lebih dari satu admin, pisahkan dengan koma:
+   `ADMIN_TELEGRAM_ID=123456789,987654321`.
+
+---
+
+## Ambil Bunny Stream API Key
+
+1. Login ke <https://dash.bunny.net/>.
+2. Buka **Stream**, pilih library Anda (ID `656273` di config bawaan).
+3. Buka tab **API**.
+4. Salin **API Key** dari sana. **Simpan rahasia.**
+5. Pastikan **Library ID** sesuai dengan yang Anda pakai (default: `656273`).
+
+> Jangan ubah konfigurasi Pull Zone Bunny secara manual. Bot ini hanya
+> menggunakan **Bunny Stream API**.
+
+---
+
+## Install Dependency
+
+### Pakai script otomatis (paling cepat)
+
+#### Linux / RDP Linux
+
+```bash
+chmod +x setup_linux.sh
+./setup_linux.sh
+```
+
+#### Windows
+
+```cmd
+setup_windows.bat
+```
+
+Skrip akan: cek Python, buat virtualenv `venv/`, install requirements,
+buat folder runtime, dan menyalin `.env.example` ke `.env` (jika belum ada).
+
+### Manual
+
+#### Linux
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip wheel
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+#### Windows
+
+```cmd
+python -m venv venv
+venv\Scripts\activate
+python -m pip install --upgrade pip wheel
+pip install -r requirements.txt
+copy .env.example .env
+```
+
+---
+
+## Isi `.env` dan `config.yaml`
+
+### `.env` - secrets (jangan commit ke git)
+
+```
+TELEGRAM_BOT_TOKEN=123456789:ABCdef...
+ADMIN_TELEGRAM_ID=123456789
+BUNNY_API_KEY=xxxxx-xxxxx-xxxxx
+```
+
+- `TELEGRAM_BOT_TOKEN` -> dari BotFather.
+- `ADMIN_TELEGRAM_ID` -> dari `@userinfobot` (boleh lebih dari satu, pisahkan
+  koma).
+- `BUNNY_API_KEY` -> dari Bunny dashboard.
+
+### `config.yaml` - non-rahasia
+
+Edit secukupnya. Yang sering diubah:
+
+```yaml
+app:
+  max_parallel_downloads: 1     # naikkan kalau VPS / RDP kuat
+  auto_delete_after_upload: true
+
+bunny:
+  library_id: "656273"
+  cdn_hostname: "vz-eaddacc6-5f8.b-cdn.net"
+
+download:
+  max_file_size_gb: 20
+```
+
+> `paths` tidak perlu diubah - semuanya relatif ke folder project.
+
+---
+
+## Menjalankan Bot
+
+### Windows
+
+```cmd
+cd bottelegram
+venv\Scripts\activate
+python bot.py
+```
+
+### Linux
+
+```bash
+cd bottelegram
+source venv/bin/activate
+python bot.py
+```
+
+Setelah ada log `Bot ready, mulai polling...`, buka Telegram, kirim `/start` ke
+bot Anda. Hanya `ADMIN_TELEGRAM_ID` yang dibalas.
+
+---
+
+## Daftar Command
+
+| Command | Deskripsi |
+| --- | --- |
+| `/start` | Info bot dan panduan singkat. |
+| `/help` | Tampilkan semua command. |
+| `/upload_bunny Judul \| URL` | Download lalu upload ke Bunny Stream. |
+| `/download Judul \| URL` | Download saja (alias `/download_only`). |
+| `/download_only Judul \| URL` | Download saja, tanpa upload. |
+| `/status VIDEO_ID` | Cek status video di Bunny. |
+| `/queue` | Lihat antrean job. |
+| `/cancel JOB_ID` | Batalkan job. |
+| `/retry JOB_ID` | Ulangi job gagal. |
+| `/history` | 10 job terakhir. |
+| `/list_files` | Isi folder downloads. |
+| `/delete_file nama_file` | Hapus file tertentu di downloads. |
+| `/clear_downloads` | Hapus semua file di downloads. |
+| `/storage` | Total / terpakai / sisa storage. |
+| `/health` | Cek bot, internet, Bunny API, folder, FFmpeg, Python. |
+| `/config` | Tampilkan konfigurasi aktif (tanpa secret). |
+| `/backup_config` | Kirim file backup konfigurasi (tanpa API key). |
+
+---
+
+## Test Download dan Test Upload Bunny
+
+1. Pastikan bot sudah jalan dan Anda sudah dibalas saat `/start`.
+2. Tes download saja:
+   ```
+   /download_only Test Video | https://drive.google.com/file/d/<FILE_ID>/view
+   ```
+   Bot akan menambahkan job, mengirim progress, lalu memberitahu hasil
+   download.
+3. Tes download + upload Bunny:
+   ```
+   /upload_bunny The Drama 2026 | https://drive.google.com/file/d/<FILE_ID>/view
+   ```
+   Setelah upload selesai bot akan mengirim:
+
+   ```
+   Upload Bunny Berhasil
+   Judul: The Drama 2026
+   Video ID: <guid>
+   Status: <encoding/processing/finished>
+   Embed URL: https://iframe.mediadelivery.net/embed/656273/<guid>
+   CDN Hostname: vz-eaddacc6-5f8.b-cdn.net
+   ```
+
+4. Cek progress encoding kapan saja:
+   ```
+   /status <guid>
+   ```
+
+---
+
+## Melihat Log
+
+- File log utama: `logs/bot.log`.
+- Rotasi otomatis: `bot.log`, `bot.log.1`, `bot.log.2`, ... (ukuran & jumlah
+  diatur di `config.yaml` -> `logging`).
+
+Linux:
+```bash
+tail -f logs/bot.log
+```
+Windows:
+```cmd
+type logs\bot.log
+```
+
+Bot **tidak pernah** menulis `TELEGRAM_BOT_TOKEN` atau `BUNNY_API_KEY` ke log.
+
+---
+
+## Memindahkan Server (VPS / RDP baru)
+
+1. Copy seluruh folder project ke server baru (boleh via `scp`, RDP file copy,
+   atau `git clone` lalu replace `.env`).
+2. Salin file rahasia: `.env` dan jika perlu `config.yaml`.
+3. Install Python (lihat seksi Persiapan).
+4. Jalankan ulang `setup_linux.sh` atau `setup_windows.bat`.
+5. `python bot.py` -> selesai.
+
+> Karena semua path **relatif**, tidak perlu mengubah konfigurasi setelah
+> pindah.
+
+---
+
+## Backup Konfigurasi
+
+- Lewat Telegram: kirim `/backup_config` ke bot. Bot akan mengirim file
+  `config-backup-<timestamp>.yaml` **tanpa** token / API key.
+- Restore: copy nilai dari file backup ke `config.yaml`, lalu isi ulang `.env`
+  secara manual (token & API key memang sengaja tidak di-backup).
+
+---
+
+## Auto-start saat Startup
+
+### Linux (systemd)
+
+Buat file `/etc/systemd/system/zaein-bot.service`:
+
+```ini
+[Unit]
+Description=ZAEIN Automation Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bottelegram
+ExecStart=/home/ubuntu/bottelegram/venv/bin/python /home/ubuntu/bottelegram/bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Aktifkan:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now zaein-bot.service
+sudo systemctl status zaein-bot.service
+journalctl -u zaein-bot.service -f
+```
+
+### Windows (Task Scheduler)
+
+1. Buka **Task Scheduler** -> **Create Task**.
+2. Tab **General**: centang `Run whether user is logged on or not` dan
+   `Run with highest privileges`.
+3. Tab **Triggers** -> **New** -> `At log on` (atau `At startup`).
+4. Tab **Actions** -> **New** ->
+   - Program/script: `C:\path\ke\bottelegram\venv\Scripts\python.exe`
+   - Add arguments: `bot.py`
+   - Start in: `C:\path\ke\bottelegram`
+5. Tab **Conditions**: matikan `Start the task only if the computer is on AC
+   power` jika di RDP.
+6. Tab **Settings**: centang `If the task fails, restart every 1 minute`.
+7. OK -> masukkan password user -> simpan.
+
+---
+
+## Troubleshooting
+
+| Masalah | Solusi |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN is empty` | Isi `.env`, jangan commit. Pastikan `.env` di root project. |
+| Bot tidak membalas | User Anda bukan admin, tambahkan ID di `ADMIN_TELEGRAM_ID`. |
+| Download Google Drive 0 byte | File terlalu populer / private. Bot otomatis fallback ke yt-dlp. |
+| `gdown error: Permission denied` | File GDrive butuh login / private, share link "Anyone with the link". |
+| `HTTP 401` saat upload Bunny | API key salah / library ID salah. Cek dashboard Bunny. |
+| Upload mentok di "Processing" | Wajar untuk video besar. Cek dengan `/status VIDEO_ID`. |
+| Storage penuh | Jalankan `/clear_downloads` atau aktifkan `auto_delete_after_upload`. |
+| `yt-dlp` butuh FFmpeg | Install FFmpeg (lihat seksi di atas). |
+| Windows: `python` tidak dikenal | Saat install Python, centang `Add Python to PATH`. |
+| Linux systemd: `status=203/EXEC` | Cek path Python di service file (`venv/bin/python`). |
+| Banyak job sekaligus tertumpuk | Naikkan `app.max_parallel_downloads` di `config.yaml`. |
+
+---
+
+## Keamanan
+
+- `.env` **selalu** di `.gitignore`. Jangan pernah commit secret.
+- Token bot & API key Bunny tidak pernah ditampilkan ke user dan tidak ditulis
+  ke log (filter redaksi otomatis).
+- Hanya `ADMIN_TELEGRAM_ID` yang bisa menjalankan command. User lain
+  ditolak dan dicatat di log.
+- Nama file disanitasi (`safe_filename`) sebelum disimpan ke disk.
+- Bot **tidak pernah** mengeksekusi shell command dari user.
+- Path traversal pada `/delete_file` dicegah secara eksplisit.
+- Validasi ekstensi sebelum upload ke Bunny: hanya `.mp4`, `.mkv`, `.mov`,
+  `.avi`, `.webm`, `.m4v`.
+
+---
+
+Selamat menggunakan, dan semoga lancar otomasinya. Jika ada error yang perlu
+investigasi cepat, sertakan isi `logs/bot.log` (yang sudah ter-redaksi
+otomatis) saat meminta bantuan.
