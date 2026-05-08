@@ -1,0 +1,55 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/*.log
+logs/*.log.*
+*.log
+
+# Runtime data / downloads / temp
+downloads/*
+!downloads/.gitkeep
+temp/*
+!temp/.gitkeep
+data/jobs.json
+data/*.bak
+
+# Coverage / test
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+desktop.ini
