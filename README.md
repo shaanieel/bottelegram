@@ -17,17 +17,18 @@ aman, dan siap dipindah-pindah server.
 5. [Buat Bot Telegram dari BotFather](#buat-bot-telegram-dari-botfather)
 6. [Ambil Telegram User ID Anda](#ambil-telegram-user-id-anda)
 7. [Ambil Bunny Stream API Key](#ambil-bunny-stream-api-key)
-8. [Install Dependency](#install-dependency)
-9. [Isi `.env` dan `config.yaml`](#isi-env-dan-configyaml)
-10. [Menjalankan Bot](#menjalankan-bot)
-11. [Daftar Command](#daftar-command)
-12. [Test Download dan Test Upload Bunny](#test-download-dan-test-upload-bunny)
-13. [Melihat Log](#melihat-log)
-14. [Memindahkan Server (VPS / RDP baru)](#memindahkan-server-vps--rdp-baru)
-15. [Backup Konfigurasi](#backup-konfigurasi)
-16. [Auto-start saat Startup](#auto-start-saat-startup)
-17. [Troubleshooting](#troubleshooting)
-18. [Keamanan](#keamanan)
+8. [Setup Google Drive API (opsional, sangat direkomendasikan)](#setup-google-drive-api-opsional-sangat-direkomendasikan)
+9. [Install Dependency](#install-dependency)
+10. [Isi `.env` dan `config.yaml`](#isi-env-dan-configyaml)
+11. [Menjalankan Bot](#menjalankan-bot)
+12. [Daftar Command](#daftar-command)
+13. [Test Download dan Test Upload Bunny](#test-download-dan-test-upload-bunny)
+14. [Melihat Log](#melihat-log)
+15. [Memindahkan Server (VPS / RDP baru)](#memindahkan-server-vps--rdp-baru)
+16. [Backup Konfigurasi](#backup-konfigurasi)
+17. [Auto-start saat Startup](#auto-start-saat-startup)
+18. [Troubleshooting](#troubleshooting)
+19. [Keamanan](#keamanan)
 
 ---
 
@@ -35,6 +36,9 @@ aman, dan siap dipindah-pindah server.
 
 - Download dari **Google Drive**, **Dropbox**, **OneDrive**, **direct link**, dan
   **link yang didukung yt-dlp**.
+- **Engine pertama untuk Google Drive: Google Drive API resmi** (lebih stabil
+  + bypass quota dengan service account), fallback otomatis ke `gdown` lalu
+  `yt-dlp` kalau API tidak dikonfigurasi atau gagal.
 - Upload ke **Bunny Stream** menggunakan API resmi (create video, put binary,
   cek status), tanpa hardcode API key.
 - **Queue system** async: kirim banyak job sekaligus, semua antri tertib.
@@ -170,6 +174,80 @@ ffmpeg -version
 
 ---
 
+## Setup Google Drive API (opsional, sangat direkomendasikan)
+
+Untuk semua link Google Drive, bot akan **mencoba Google Drive API resmi
+terlebih dahulu** sebelum fallback ke `gdown` / `yt-dlp`. Pakai API resmi punya
+kelebihan dibanding scraping HTML lewat `gdown`:
+
+- **Lebih stabil** — tidak rusak saat Google ubah halaman download.
+- **Bypass "quota exceeded"** — pakai project / service account sendiri.
+- **Akses file private** — file di Drive Anda sendiri / Shared Drive yang
+  di-share ke service account bisa di-download tanpa "Anyone with the link".
+- **Lebih cepat** untuk file besar.
+
+Ada dua mode auth, pilih sesuai kebutuhan:
+
+### Mode A — API Key (paling cepat setup, cuma untuk file PUBLIC)
+
+1. Buka <https://console.cloud.google.com/apis/credentials>.
+2. Buat / pilih sebuah project.
+3. Aktifkan **Google Drive API** di
+   <https://console.cloud.google.com/apis/library/drive.googleapis.com>.
+4. Klik **Create Credentials** -> **API key**. Salin keynya.
+5. (Opsional tapi bagus) Klik API key yang baru, lalu di **API restrictions**
+   pilih `Restrict key` -> centang `Google Drive API` saja.
+6. Tempel ke `.env`:
+   ```
+   GOOGLE_DRIVE_API_KEY=AIzaSy...
+   ```
+
+API key hanya bekerja untuk file dengan akses "Anyone with the link". File
+benar-benar private akan return 404.
+
+### Mode B — Service Account (file PUBLIC + PRIVATE)
+
+1. Di Cloud Console yang sama, **IAM & Admin** -> **Service Accounts** ->
+   **Create Service Account**.
+2. Beri nama `zaein-drive-downloader`, klik Create dan **Done** (tidak perlu
+   role IAM project-level).
+3. Klik service account yang baru -> tab **Keys** -> **Add Key** -> **Create
+   new key** -> **JSON**. File JSON akan otomatis ter-download.
+4. Simpan file ke folder project, contoh `secrets/sa-drive.json` (folder
+   `secrets/` sudah di `.gitignore`).
+5. **Penting**: share file / folder / Shared Drive yang ingin di-download ke
+   email service account (alamatnya seperti
+   `zaein-drive-downloader@xxx.iam.gserviceaccount.com`) dengan akses minimal
+   `Viewer`.
+6. Tempel path ke `.env`:
+   ```
+   GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON=secrets/sa-drive.json
+   ```
+
+Library `google-auth` (sudah ada di `requirements.txt`) yang dipakai untuk
+sign JWT dan tukar dengan access token.
+
+### Verifikasi
+
+Setelah isi `.env`, jalankan ulang bot dan kirim `/health`. Akan muncul baris
+seperti:
+
+```
+GDrive API: OK [service_account] (Service Account OK)
+```
+
+atau jika tidak dikonfigurasi:
+
+```
+GDrive API: tidak dikonfigurasi (fallback ke gdown)
+```
+
+> Tidak perlu set keduanya. Service account dipakai duluan kalau ada, kalau
+> tidak baru API key. Kalau dua-duanya kosong, bot otomatis pakai `gdown`
+> seperti sebelumnya.
+
+---
+
 ## Install Dependency
 
 ### Pakai script otomatis (paling cepat)
@@ -222,12 +300,18 @@ copy .env.example .env
 TELEGRAM_BOT_TOKEN=123456789:ABCdef...
 ADMIN_TELEGRAM_ID=123456789
 BUNNY_API_KEY=xxxxx-xxxxx-xxxxx
+GOOGLE_DRIVE_API_KEY=
+GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON=
 ```
 
 - `TELEGRAM_BOT_TOKEN` -> dari BotFather.
 - `ADMIN_TELEGRAM_ID` -> dari `@userinfobot` (boleh lebih dari satu, pisahkan
   koma).
 - `BUNNY_API_KEY` -> dari Bunny dashboard.
+- `GOOGLE_DRIVE_API_KEY` -> opsional, untuk download file Drive PUBLIC pakai
+  Google Drive API resmi (lihat seksi "Setup Google Drive API").
+- `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` -> opsional, path ke file JSON service
+  account untuk akses file PRIVATE / Shared Drive (lihat seksi yang sama).
 
 ### `config.yaml` - non-rahasia
 
@@ -425,8 +509,10 @@ journalctl -u zaein-bot.service -f
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN is empty` | Isi `.env`, jangan commit. Pastikan `.env` di root project. |
 | Bot tidak membalas | User Anda bukan admin, tambahkan ID di `ADMIN_TELEGRAM_ID`. |
-| Download Google Drive 0 byte | File terlalu populer / private. Bot otomatis fallback ke yt-dlp. |
-| `gdown error: Permission denied` | File GDrive butuh login / private, share link "Anyone with the link". |
+| Download Google Drive 0 byte | File terlalu populer / private. Set `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` lalu share file ke email SA, atau bot fallback ke yt-dlp. |
+| `gdown error: Permission denied` | File GDrive butuh login / private. Pakai mode Service Account (lihat seksi GDrive API), atau share link "Anyone with the link". |
+| `GDriveAPI ... HTTP 403 (storageQuotaExceeded)` | Quota harian project Cloud habis. Tunggu reset, naikkan kuota, atau pakai service account lain. |
+| `/health` GDrive API FAIL `google-auth tidak terinstall` | Jalankan `pip install -r requirements.txt` ulang setelah update bot. |
 | `HTTP 401` saat upload Bunny | API key salah / library ID salah. Cek dashboard Bunny. |
 | Upload mentok di "Processing" | Wajar untuk video besar. Cek dengan `/status VIDEO_ID`. |
 | Storage penuh | Jalankan `/clear_downloads` atau aktifkan `auto_delete_after_upload`. |

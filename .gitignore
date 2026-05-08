@@ -2,6 +2,9 @@
 .env
 .env.local
 .env.*.local
+secrets/
+*.serviceaccount.json
+*-sa.json
 
 # Python
 __pycache__/

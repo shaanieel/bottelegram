@@ -6,3 +6,4 @@ aiohttp>=3.10.5
 gdown>=5.2.0
 yt-dlp>=2024.10.7
 tqdm>=4.66.5
+google-auth>=2.34.0
