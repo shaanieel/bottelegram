@@ -66,6 +66,9 @@ class DownloadSection:
     request_timeout_seconds: int = 60
     chunk_size_bytes: int = 1024 * 1024
     user_agent: str = "Mozilla/5.0 (compatible; ZAEINBot/1.0)"
+    prefer_gdrive_api: bool = True
+    gdrive_api_timeout_seconds: int = 30
+    gdrive_api_chunk_size_bytes: int = 8 * 1024 * 1024
 
 
 @dataclass
@@ -87,9 +90,15 @@ class Secrets:
     telegram_bot_token: str = ""
     admin_telegram_ids: tuple[int, ...] = ()
     bunny_api_key: str = ""
+    google_drive_api_key: str = ""
+    google_drive_service_account_json: str = ""
 
     def values_to_redact(self) -> list[str]:
-        out = [self.telegram_bot_token, self.bunny_api_key]
+        out = [
+            self.telegram_bot_token,
+            self.bunny_api_key,
+            self.google_drive_api_key,
+        ]
         return [v for v in out if v]
 
 
@@ -138,6 +147,8 @@ class AppConfig:
                 "request_timeout_seconds": self.download.request_timeout_seconds,
                 "chunk_size_bytes": self.download.chunk_size_bytes,
                 "user_agent": self.download.user_agent,
+                "prefer_gdrive_api": self.download.prefer_gdrive_api,
+                "gdrive_api_chunk_size_bytes": self.download.gdrive_api_chunk_size_bytes,
             },
             "upload_targets": {
                 "bunny_stream": {"enabled": self.upload_targets.bunny_stream_enabled},
@@ -152,6 +163,10 @@ class AppConfig:
             "admin_count": len(self.secrets.admin_telegram_ids),
             "telegram_bot_token_set": bool(self.secrets.telegram_bot_token),
             "bunny_api_key_set": bool(self.secrets.bunny_api_key),
+            "gdrive_api_key_set": bool(self.secrets.google_drive_api_key),
+            "gdrive_service_account_set": bool(
+                self.secrets.google_drive_service_account_json
+            ),
         }
 
 
@@ -239,6 +254,13 @@ def load_config(
                 "Mozilla/5.0 (compatible; ZAEINBot/1.0)",
             )
         ),
+        prefer_gdrive_api=bool(download_raw.get("prefer_gdrive_api", True)),
+        gdrive_api_timeout_seconds=int(
+            download_raw.get("gdrive_api_timeout_seconds", 30)
+        ),
+        gdrive_api_chunk_size_bytes=int(
+            download_raw.get("gdrive_api_chunk_size_bytes", 8 * 1024 * 1024)
+        ),
     )
 
     targets = UploadTargetsSection(
@@ -271,6 +293,10 @@ def load_config(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         admin_telegram_ids=_parse_admin_ids(os.getenv("ADMIN_TELEGRAM_ID")),
         bunny_api_key=os.getenv("BUNNY_API_KEY", "").strip(),
+        google_drive_api_key=os.getenv("GOOGLE_DRIVE_API_KEY", "").strip(),
+        google_drive_service_account_json=os.getenv(
+            "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", ""
+        ).strip(),
     )
 
     return AppConfig(

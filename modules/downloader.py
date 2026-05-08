@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from .config_manager import AppConfig
+from .gdrive_api import GDriveAPIClient, GDriveAPIError
 from .logger import get_logger
 from .storage_manager import ensure_unique_path, human_bytes, safe_unlink
 from .validators import (
@@ -69,6 +70,21 @@ async def download(
     await _emit(progress_cb, "starting", None, f"Mendeteksi jenis link: {info.kind}")
 
     if info.kind == "google_drive":
+        # Engine order: GDriveAPI (preferred) -> gdown -> yt-dlp.
+        gdrive_client = GDriveAPIClient(cfg)
+        if cfg.download.prefer_gdrive_api and gdrive_client.is_configured():
+            try:
+                return await _download_gdrive_api(
+                    info, safe_title, cfg, gdrive_client, progress_cb, cancel_event
+                )
+            except DownloadError as exc:
+                log.warning("GDriveAPI gagal (%s), fallback ke gdown", exc)
+                await _emit(
+                    progress_cb,
+                    "fallback",
+                    None,
+                    f"GDriveAPI gagal: {exc}. Mencoba gdown…",
+                )
         try:
             return await _download_gdrive(info, safe_title, cfg, progress_cb, cancel_event)
         except DownloadError as exc:
@@ -110,6 +126,36 @@ async def _emit(cb: ProgressCB, stage: str, percent: Optional[float], message: s
 def _check_cancel(cancel_event: Optional[asyncio.Event]) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadError("Job dibatalkan oleh user")
+
+
+# ----- Google Drive (official API) ----------------------------------------- #
+
+async def _download_gdrive_api(
+    info: LinkInfo,
+    title: str,
+    cfg: AppConfig,
+    client: GDriveAPIClient,
+    progress_cb: ProgressCB,
+    cancel_event: Optional[asyncio.Event],
+) -> DownloadResult:
+    file_id = info.file_id or extract_google_drive_id(info.url)
+    if not file_id:
+        raise DownloadError("Tidak bisa extract Google Drive FILE_ID")
+    try:
+        target, size, _meta = await client.download(
+            file_id, title, progress_cb=progress_cb, cancel_event=cancel_event
+        )
+    except GDriveAPIError as exc:
+        raise DownloadError(str(exc)) from exc
+
+    _check_cancel(cancel_event)
+    _check_max_size(size, cfg, target)
+    return DownloadResult(
+        path=target,
+        size_bytes=size,
+        source_kind="google_drive",
+        tool_used=f"gdrive_api/{client.auth_mode()}",
+    )
 
 
 # ----- Google Drive (gdown) ------------------------------------------------- #

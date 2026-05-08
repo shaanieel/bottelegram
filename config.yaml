@@ -30,6 +30,14 @@ download:
   chunk_size_bytes: 1048576 # 1 MiB
   user_agent: "Mozilla/5.0 (compatible; ZAEINBot/1.0)"
 
+  # Engine order untuk link Google Drive:
+  #   1. GDriveAPI (kalau prefer_gdrive_api=true DAN API key/SA dikonfigurasi)
+  #   2. gdown
+  #   3. yt-dlp (fallback terakhir)
+  prefer_gdrive_api: true
+  gdrive_api_timeout_seconds: 30
+  gdrive_api_chunk_size_bytes: 8388608  # 8 MiB
+
 upload_targets:
   bunny_stream:
     enabled: true

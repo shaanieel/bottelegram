@@ -33,6 +33,7 @@ from telegram.ext import (
 from .bunny_uploader import BunnyUploader
 from .config_manager import AppConfig
 from .downloader import DownloadError, download, is_uploadable_video
+from .gdrive_api import GDriveAPIClient
 from .logger import get_logger
 from .queue_manager import Job, JobStatus, JobType, QueueManager
 from .storage_manager import (
@@ -413,6 +414,15 @@ class BotApp:
 
         net_ok, net_msg = await asyncio.to_thread(_check_internet)
         bunny_ok, bunny_msg = await self.bunny.health_check()
+        gdrive_client = GDriveAPIClient(self.cfg)
+        if gdrive_client.is_configured():
+            gdrive_ok, gdrive_msg = await gdrive_client.health_check()
+            gdrive_line = (
+                f"GDrive API: {'OK' if gdrive_ok else 'FAIL'} "
+                f"[{gdrive_client.auth_mode()}] ({gdrive_msg})"
+            )
+        else:
+            gdrive_line = "GDrive API: tidak dikonfigurasi (fallback ke gdown)"
         ffmpeg_path = shutil.which("ffmpeg")
         py_version = ".".join(str(v) for v in sys.version_info[:3])
 
@@ -432,6 +442,7 @@ class BotApp:
             f"Python: {py_version}\n"
             f"Internet: {'OK' if net_ok else 'FAIL'} ({net_msg})\n"
             f"Bunny API: {'OK' if bunny_ok else 'FAIL'} ({bunny_msg})\n"
+            f"{gdrive_line}\n"
             f"FFmpeg: {'OK (' + ffmpeg_path + ')' if ffmpeg_path else 'tidak ditemukan (opsional)'}\n"
             "Folder:\n  " + "\n  ".join(folders)
         )
