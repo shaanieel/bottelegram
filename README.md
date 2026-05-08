@@ -61,8 +61,10 @@ bottelegram/
 ├── config.yaml                # Konfigurasi non-rahasia
 ├── .env.example               # Template untuk .env (rahasia)
 ├── requirements.txt
-├── setup_windows.bat
-├── setup_linux.sh
+├── setup_windows.bat          # Sekali jalan: install deps & buat venv (Windows)
+├── setup_linux.sh             # Sekali jalan: install deps & buat venv (Linux)
+├── start_bot.bat              # Double-click untuk jalankan bot (Windows)
+├── start_bot.sh               # ./start_bot.sh untuk jalankan bot (Linux)
 ├── README.md
 ├── .gitignore
 ├── downloads/                 # File hasil download
@@ -336,7 +338,31 @@ download:
 
 ## Menjalankan Bot
 
-### Windows
+### Cara cepat — pakai launcher (rekomendasi)
+
+#### Windows
+
+Cukup **double-click `start_bot.bat`** di folder project. Script ini akan:
+
+1. Cek `venv\` dan `.env` sudah ada (kalau belum, kasih instruksi yang harus
+   dijalankan).
+2. Activate venv otomatis dan jalankan `python bot.py`.
+3. Auto-restart sampai 5x kalau bot crash (delay 5 detik antar restart).
+4. Tetap di terminal supaya log bot kelihatan; tutup window untuk stop.
+
+#### Linux
+
+```bash
+chmod +x start_bot.sh
+./start_bot.sh
+```
+
+(`chmod +x` cukup sekali.) Script `.sh` punya fitur sama seperti `.bat`:
+auto-restart, cek venv & `.env`, dan trap Ctrl+C untuk shutdown bersih.
+
+### Cara manual
+
+#### Windows
 
 ```cmd
 cd bottelegram
@@ -344,7 +370,7 @@ venv\Scripts\activate
 python bot.py
 ```
 
-### Linux
+#### Linux
 
 ```bash
 cd bottelegram
