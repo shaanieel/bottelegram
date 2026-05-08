@@ -51,11 +51,20 @@ log = get_logger(__name__)
 
 # ----- Auth decorator ------------------------------------------------------- #
 
-def admin_only(
-    handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]],
-) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
+def admin_only(handler: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+    """Reject any update whose sender is not in ``ADMIN_TELEGRAM_ID``.
+
+    Works for both standalone functions ``handler(update, context)`` and bound
+    methods ``handler(self, update, context)`` — the last two positional args
+    are always the ``Update`` and ``ContextTypes.DEFAULT_TYPE`` instances.
+    """
+
     @wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def wrapper(*args, **kwargs) -> None:
+        if len(args) < 2:
+            return await handler(*args, **kwargs)
+        update: Update = args[-2]
+        context: ContextTypes.DEFAULT_TYPE = args[-1]
         cfg: AppConfig = context.application.bot_data["config"]
         user = update.effective_user
         if user is None or user.id not in cfg.secrets.admin_telegram_ids:
@@ -69,7 +78,7 @@ def admin_only(
                     "Akses ditolak. Bot ini hanya untuk admin."
                 )
             return
-        return await handler(update, context)
+        return await handler(*args, **kwargs)
 
     return wrapper
 

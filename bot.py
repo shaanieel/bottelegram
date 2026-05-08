@@ -81,11 +81,27 @@ def main() -> int:
     return 0
 
 
+def _configure_windows_event_loop() -> None:
+    """On Windows, prefer the selector loop for asyncio + aiohttp compatibility.
+
+    ``WindowsSelectorEventLoopPolicy`` is deprecated in Python 3.16 — silence
+    that warning since we still need it on supported versions.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    import warnings
+
+    selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if selector_policy is None:
+        return
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            asyncio.set_event_loop_policy(selector_policy())
+    except (AttributeError, NotImplementedError):
+        pass
+
+
 if __name__ == "__main__":
-    # Windows requires the selector loop policy for asyncio + aiohttp to behave
-    if sys.platform.startswith("win"):
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except AttributeError:
-            pass
+    _configure_windows_event_loop()
     raise SystemExit(main())
