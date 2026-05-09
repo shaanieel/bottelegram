@@ -70,7 +70,13 @@ async def download(
     await _emit(progress_cb, "starting", None, f"Mendeteksi jenis link: {info.kind}")
 
     if info.kind == "google_drive":
-        # Engine order: GDriveAPI (preferred) -> gdown -> yt-dlp.
+        # Engine order for Drive:
+        #   1. GDriveAPI (preferred when configured)
+        #   2. gdown
+        #   3. direct stream from drive.google.com/uc?id=...&export=download
+        # We deliberately do NOT fall back to yt-dlp for Drive: yt-dlp's Drive
+        # extractor currently 403s on Google's hardcoded API key, and the
+        # direct uc-download already covers every public Drive file.
         gdrive_client = GDriveAPIClient(cfg)
         if cfg.download.prefer_gdrive_api and gdrive_client.is_configured():
             try:
@@ -88,16 +94,19 @@ async def download(
         try:
             return await _download_gdrive(info, safe_title, cfg, progress_cb, cancel_event)
         except DownloadError as exc:
-            if cfg.download.allow_ytdlp:
-                log.warning("Google Drive download failed (%s), falling back to yt-dlp", exc)
-                await _emit(
-                    progress_cb,
-                    "fallback",
-                    None,
-                    f"gdown gagal: {exc}. Mencoba yt-dlp…",
-                )
-                return await _download_ytdlp(info, safe_title, cfg, progress_cb, cancel_event)
-            raise
+            log.warning(
+                "Google Drive gdown failed (%s), fallback ke direct uc-download",
+                exc,
+            )
+            await _emit(
+                progress_cb,
+                "fallback",
+                None,
+                f"gdown gagal: {exc}. Mencoba direct uc-download…",
+            )
+            return await _download_gdrive_direct(
+                info, safe_title, cfg, progress_cb, cancel_event
+            )
 
     if info.kind in ("dropbox", "onedrive", "direct"):
         return await _download_direct(info, safe_title, cfg, progress_cb, cancel_event)
@@ -184,8 +193,18 @@ async def _download_gdrive(
 
         # gdown can resolve filename automatically when output ends with a directory.
         out_dir = str(download_dir) + os.sep
+        # `fuzzy=True` was the default in gdown<5 but removed as a kwarg in
+        # gdown>=6 (treated implicitly). Pass it only when the installed
+        # version actually accepts it.
+        kwargs: dict = {"id": file_id, "output": out_dir, "quiet": True}
         try:
-            saved = gdown.download(id=file_id, output=out_dir, quiet=True, fuzzy=True)
+            sig = inspect.signature(gdown.download)
+            if "fuzzy" in sig.parameters:
+                kwargs["fuzzy"] = True
+        except (TypeError, ValueError):
+            pass
+        try:
+            saved = gdown.download(**kwargs)
         except Exception as exc:  # gdown raises various exceptions
             raise DownloadError(f"gdown error: {exc}") from exc
         if not saved:
@@ -226,6 +245,126 @@ async def _download_gdrive(
     )
 
 
+# ----- Google Drive (direct uc-download fallback) -------------------------- #
+
+async def _download_gdrive_direct(
+    info: LinkInfo,
+    title: str,
+    cfg: AppConfig,
+    progress_cb: ProgressCB,
+    cancel_event: Optional[asyncio.Event],
+) -> DownloadResult:
+    """Last-resort Drive downloader using the public ``uc?export=download`` URL.
+
+    Works for any file marked "Anyone with the link" without any API key. For
+    files larger than ~100 MiB Google returns an interstitial "virus scan"
+    HTML page; we follow it by re-issuing the request with a confirmation
+    token harvested from the cookies / form (handled inline below).
+    """
+    file_id = info.file_id or extract_google_drive_id(info.url)
+    if not file_id:
+        raise DownloadError("Tidak bisa extract Google Drive FILE_ID")
+
+    download_dir = cfg.paths.download_dir
+    temp_dir = cfg.paths.temp_dir
+    download_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    headers = {"User-Agent": cfg.download.user_agent}
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+    chunk_size = max(64 * 1024, cfg.download.chunk_size_bytes)
+    max_bytes = cfg.download.max_file_size_gb * (1024 ** 3)
+
+    base_url = "https://drive.usercontent.google.com/download"
+    params = {"id": file_id, "export": "download", "confirm": "t"}
+
+    await _emit(
+        progress_cb,
+        "downloading",
+        0.0,
+        f"Direct uc-download Google Drive (id={file_id})",
+    )
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(base_url, params=params, allow_redirects=True) as resp:
+            if resp.status >= 400:
+                raise DownloadError(
+                    f"Drive direct HTTP {resp.status}. File mungkin private "
+                    "atau hanya tersedia di akun Google tertentu."
+                )
+
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" in ctype:
+                # Google sent the virus-scan / quota interstitial. Try once
+                # more with the form's hidden fields parsed out of the body.
+                body = await resp.text()
+                form = _extract_drive_confirm_form(body)
+                if not form:
+                    raise DownloadError(
+                        "Drive direct: dapat halaman HTML, bukan file. Pastikan "
+                        "file di-share 'Anyone with the link'."
+                    )
+                async with session.get(
+                    form["action"],
+                    params=form["params"],
+                    allow_redirects=True,
+                ) as resp2:
+                    if resp2.status >= 400 or "text/html" in (
+                        resp2.headers.get("Content-Type") or ""
+                    ).lower():
+                        raise DownloadError(
+                            f"Drive direct masih HTML setelah confirm "
+                            f"(HTTP {resp2.status}). File mungkin private."
+                        )
+                    return await _stream_to_file(
+                        resp2,
+                        title=title,
+                        download_dir=download_dir,
+                        temp_dir=temp_dir,
+                        chunk_size=chunk_size,
+                        max_bytes=max_bytes,
+                        max_gb=cfg.download.max_file_size_gb,
+                        progress_cb=progress_cb,
+                        cancel_event=cancel_event,
+                        source_kind="google_drive",
+                        tool_used="drive_uc_direct",
+                    )
+
+            return await _stream_to_file(
+                resp,
+                title=title,
+                download_dir=download_dir,
+                temp_dir=temp_dir,
+                chunk_size=chunk_size,
+                max_bytes=max_bytes,
+                max_gb=cfg.download.max_file_size_gb,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                source_kind="google_drive",
+                tool_used="drive_uc_direct",
+            )
+
+
+_DRIVE_FORM_RE = re.compile(
+    r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', re.I
+)
+_DRIVE_HIDDEN_RE = re.compile(
+    r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"', re.I
+)
+
+
+def _extract_drive_confirm_form(html_body: str) -> Optional[dict]:
+    """Pull (action, hidden-field dict) out of Drive's confirm interstitial."""
+    m = _DRIVE_FORM_RE.search(html_body)
+    if not m:
+        return None
+    action = m.group(1).replace("&amp;", "&")
+    fields: dict[str, str] = {}
+    for nm, val in _DRIVE_HIDDEN_RE.findall(html_body):
+        fields[nm] = val.replace("&amp;", "&")
+    return {"action": action, "params": fields}
+
+
 # ----- Direct / Dropbox / OneDrive ----------------------------------------- #
 
 _DISPOSITION_FILENAME_RE = re.compile(
@@ -258,50 +397,82 @@ async def _download_direct(
             if resp.status >= 400:
                 raise DownloadError(f"HTTP {resp.status} dari {info.url}")
 
-            total = int(resp.headers.get("Content-Length") or 0)
-            if total and max_bytes and total > max_bytes:
-                raise DownloadError(
-                    f"Ukuran file ({human_bytes(total)}) melebihi limit "
-                    f"{cfg.download.max_file_size_gb} GB"
-                )
+            return await _stream_to_file(
+                resp,
+                title=title,
+                download_dir=download_dir,
+                temp_dir=temp_dir,
+                chunk_size=chunk_size,
+                max_bytes=max_bytes,
+                max_gb=cfg.download.max_file_size_gb,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                source_kind=info.kind,
+                tool_used="aiohttp",
+            )
 
-            filename = _filename_from_response(resp, info.url, title)
-            target_ext = Path(filename).suffix or ".bin"
-            target_path = ensure_unique_path(download_dir / f"{title}{target_ext}")
-            tmp_path = temp_dir / (target_path.name + ".part")
 
-            written = 0
-            last_pct = -1
-            try:
-                with tmp_path.open("wb") as f:
-                    async for chunk in resp.content.iter_chunked(chunk_size):
-                        if not chunk:
-                            continue
-                        _check_cancel(cancel_event)
-                        f.write(chunk)
-                        written += len(chunk)
-                        if max_bytes and written > max_bytes:
-                            raise DownloadError(
-                                f"File melewati limit {cfg.download.max_file_size_gb} GB"
-                            )
-                        if total:
-                            pct = (written / total) * 100
-                            ipct = int(pct)
-                            if ipct != last_pct and ipct % 5 == 0:
-                                last_pct = ipct
-                                await _emit(
-                                    progress_cb,
-                                    "downloading",
-                                    pct,
-                                    f"Download {ipct}% ({human_bytes(written)}/{human_bytes(total)})",
-                                )
-                tmp_path.replace(target_path)
-            except Exception:
-                safe_unlink(tmp_path)
-                raise
+async def _stream_to_file(
+    resp: aiohttp.ClientResponse,
+    *,
+    title: str,
+    download_dir: Path,
+    temp_dir: Path,
+    chunk_size: int,
+    max_bytes: int,
+    max_gb: int,
+    progress_cb: ProgressCB,
+    cancel_event: Optional[asyncio.Event],
+    source_kind: str,
+    tool_used: str,
+) -> DownloadResult:
+    """Stream an open ``aiohttp`` response into ``downloads/<title><ext>``."""
+    total = int(resp.headers.get("Content-Length") or 0)
+    if total and max_bytes and total > max_bytes:
+        raise DownloadError(
+            f"Ukuran file ({human_bytes(total)}) melebihi limit {max_gb} GB"
+        )
+
+    filename = _filename_from_response(resp, str(resp.url), title)
+    target_ext = Path(filename).suffix or ".bin"
+    target_path = ensure_unique_path(download_dir / f"{title}{target_ext}")
+    tmp_path = temp_dir / (target_path.name + ".part")
+
+    written = 0
+    last_pct = -1
+    try:
+        with tmp_path.open("wb") as f:
+            async for chunk in resp.content.iter_chunked(chunk_size):
+                if not chunk:
+                    continue
+                _check_cancel(cancel_event)
+                f.write(chunk)
+                written += len(chunk)
+                if max_bytes and written > max_bytes:
+                    raise DownloadError(f"File melewati limit {max_gb} GB")
+                if total:
+                    pct = (written / total) * 100
+                    ipct = int(pct)
+                    if ipct != last_pct and ipct % 5 == 0:
+                        last_pct = ipct
+                        await _emit(
+                            progress_cb,
+                            "downloading",
+                            pct,
+                            f"Download {ipct}% ({human_bytes(written)}/{human_bytes(total)})",
+                        )
+        tmp_path.replace(target_path)
+    except Exception:
+        safe_unlink(tmp_path)
+        raise
 
     size = target_path.stat().st_size
-    _check_max_size(size, cfg, target_path)
+    if max_bytes and size > max_bytes:
+        safe_unlink(target_path)
+        raise DownloadError(
+            f"File ({human_bytes(size)}) melebihi limit {max_gb} GB"
+        )
+
     await _emit(
         progress_cb,
         "downloaded",
@@ -311,8 +482,8 @@ async def _download_direct(
     return DownloadResult(
         path=target_path,
         size_bytes=size,
-        source_kind=info.kind,
-        tool_used="aiohttp",
+        source_kind=source_kind,
+        tool_used=tool_used,
     )
 
 
