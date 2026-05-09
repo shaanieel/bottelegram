@@ -41,6 +41,14 @@ download:
 upload_targets:
   bunny_stream:
     enabled: true
+  player4me:
+    enabled: true
+    # Kalau true dan URL terlihat publik (Drive uc?id=, dll), bot akan coba
+    # advance-upload (server player4me yang fetch) sebelum jatuh ke TUS lokal.
+    prefer_url_ingest: true
+    # Optional Folder ID untuk auto-foldering di player4me. Kosongkan bila
+    # tidak butuh.
+    default_folder_id: ""
   local_only:
     enabled: true
 

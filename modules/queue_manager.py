@@ -26,6 +26,7 @@ log = get_logger(__name__)
 
 class JobType(str, Enum):
     UPLOAD_BUNNY = "upload_bunny"
+    UPLOAD_PLAYER4ME = "upload_player4me"
     DOWNLOAD_ONLY = "download_only"
 
 
@@ -61,6 +62,10 @@ class Job:
     bunny_video_id: Optional[str] = None
     bunny_status: Optional[str] = None
     embed_url: Optional[str] = None
+    player4me_task_id: Optional[str] = None
+    player4me_video_id: Optional[str] = None
+    player4me_status: Optional[str] = None
+    player4me_engine: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

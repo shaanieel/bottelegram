@@ -74,7 +74,10 @@ class DownloadSection:
 @dataclass
 class UploadTargetsSection:
     bunny_stream_enabled: bool = True
+    player4me_enabled: bool = True
     local_only_enabled: bool = True
+    player4me_prefer_url_ingest: bool = True
+    player4me_default_folder_id: str = ""
 
 
 @dataclass
@@ -92,12 +95,14 @@ class Secrets:
     bunny_api_key: str = ""
     google_drive_api_key: str = ""
     google_drive_service_account_json: str = ""
+    player4me_api_token: str = ""
 
     def values_to_redact(self) -> list[str]:
         out = [
             self.telegram_bot_token,
             self.bunny_api_key,
             self.google_drive_api_key,
+            self.player4me_api_token,
         ]
         return [v for v in out if v]
 
@@ -152,6 +157,13 @@ class AppConfig:
             },
             "upload_targets": {
                 "bunny_stream": {"enabled": self.upload_targets.bunny_stream_enabled},
+                "player4me": {
+                    "enabled": self.upload_targets.player4me_enabled,
+                    "prefer_url_ingest": self.upload_targets.player4me_prefer_url_ingest,
+                    "default_folder_id_set": bool(
+                        self.upload_targets.player4me_default_folder_id
+                    ),
+                },
                 "local_only": {"enabled": self.upload_targets.local_only_enabled},
             },
             "video_extensions": list(self.video_extensions),
@@ -167,6 +179,7 @@ class AppConfig:
             "gdrive_service_account_set": bool(
                 self.secrets.google_drive_service_account_json
             ),
+            "player4me_api_token_set": bool(self.secrets.player4me_api_token),
         }
 
 
@@ -263,13 +276,19 @@ def load_config(
         ),
     )
 
+    p4m_raw = targets_raw.get("player4me") or {}
     targets = UploadTargetsSection(
         bunny_stream_enabled=bool(
             (targets_raw.get("bunny_stream") or {}).get("enabled", True)
         ),
+        player4me_enabled=bool(p4m_raw.get("enabled", True)),
         local_only_enabled=bool(
             (targets_raw.get("local_only") or {}).get("enabled", True)
         ),
+        player4me_prefer_url_ingest=bool(p4m_raw.get("prefer_url_ingest", True)),
+        player4me_default_folder_id=str(
+            p4m_raw.get("default_folder_id", "") or ""
+        ).strip(),
     )
 
     log = LoggingSection(
@@ -297,6 +316,7 @@ def load_config(
         google_drive_service_account_json=os.getenv(
             "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", ""
         ).strip(),
+        player4me_api_token=os.getenv("PLAYER4ME_API_TOKEN", "").strip(),
     )
 
     return AppConfig(
@@ -333,4 +353,8 @@ def validate_secrets(cfg: AppConfig) -> list[str]:
         problems.append("BUNNY_API_KEY is empty but Bunny upload is enabled")
     if cfg.upload_targets.bunny_stream_enabled and not cfg.bunny.library_id:
         problems.append("bunny.library_id is empty in config.yaml")
+    if cfg.upload_targets.player4me_enabled and not cfg.secrets.player4me_api_token:
+        problems.append(
+            "PLAYER4ME_API_TOKEN is empty but Player4Me upload is enabled"
+        )
     return problems
