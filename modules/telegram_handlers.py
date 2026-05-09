@@ -14,16 +14,23 @@ import socket
 import sys
 import time
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import yaml
-from telegram import Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -35,6 +42,7 @@ from .config_manager import AppConfig
 from .downloader import DownloadError, download, is_uploadable_video
 from .gdrive_api import GDriveAPIClient
 from .logger import get_logger
+from .player4me_uploader import Player4MeError, Player4MeUploader
 from .queue_manager import Job, JobStatus, JobType, QueueManager
 from .storage_manager import (
     clear_directory,
@@ -45,7 +53,12 @@ from .storage_manager import (
     list_files,
     safe_unlink,
 )
-from .validators import parse_command_args
+from .validators import (
+    classify_link,
+    is_url,
+    parse_command_args,
+    safe_filename,
+)
 
 log = get_logger(__name__)
 
@@ -97,6 +110,7 @@ class BotApp:
         self.cfg = cfg
         self.application = application
         self.bunny = BunnyUploader(cfg)
+        self.player4me = Player4MeUploader(cfg)
         self.queue = QueueManager(
             cfg,
             worker=self._run_job,
@@ -106,10 +120,16 @@ class BotApp:
         self._progress_msg: dict[str, tuple[int, int]] = {}
         self._last_render: dict[str, str] = {}
         self._last_progress_emit: dict[str, float] = {}
+        # Pending /m requests waiting for the user to pick an upload target.
+        # Mapping: pending_id -> (chat_id, user_id, title, url)
+        self._pending_mirror: dict[
+            str, tuple[int, int, str, str]
+        ] = {}
 
         application.bot_data["config"] = cfg
         application.bot_data["queue"] = self.queue
         application.bot_data["bunny"] = self.bunny
+        application.bot_data["player4me"] = self.player4me
         application.bot_data["bot_app"] = self
 
         self._register_handlers()
@@ -120,7 +140,13 @@ class BotApp:
         app = self.application
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
+        # Short mirror command — download then prompt for upload target.
+        app.add_handler(CommandHandler("m", self.cmd_mirror))
+        app.add_handler(CommandHandler("mirror", self.cmd_mirror))
         app.add_handler(CommandHandler("upload_bunny", self.cmd_upload_bunny))
+        app.add_handler(
+            CommandHandler("upload_player4me", self.cmd_upload_player4me)
+        )
         app.add_handler(CommandHandler("download_only", self.cmd_download_only))
         app.add_handler(CommandHandler("download", self.cmd_download_only))
         app.add_handler(CommandHandler("status", self.cmd_status))
@@ -135,6 +161,10 @@ class BotApp:
         app.add_handler(CommandHandler("health", self.cmd_health))
         app.add_handler(CommandHandler("config", self.cmd_config))
         app.add_handler(CommandHandler("backup_config", self.cmd_backup_config))
+        # Inline-keyboard callbacks for /m flow
+        app.add_handler(
+            CallbackQueryHandler(self.cb_mirror_choice, pattern=r"^mirror:")
+        )
         # Fallback for unknown text from non-admins so we always reply gracefully
         app.add_handler(MessageHandler(filters.COMMAND, self.cmd_unknown))
 
@@ -142,6 +172,41 @@ class BotApp:
 
     async def start(self) -> None:
         await self.queue.start()
+        await self._publish_bot_commands()
+
+    async def _publish_bot_commands(self) -> None:
+        """Tell Telegram which commands to autocomplete when user types ``/``."""
+        commands = [
+            BotCommand("start", "Info bot dan panduan singkat"),
+            BotCommand("help", "Daftar semua command"),
+            BotCommand("m", "Mirror: download lalu pilih target upload"),
+            BotCommand(
+                "upload_bunny",
+                "Download + upload ke Bunny Stream",
+            ),
+            BotCommand(
+                "upload_player4me",
+                "Download + upload ke Player4Me",
+            ),
+            BotCommand("download", "Download saja, tanpa upload"),
+            BotCommand("status", "Cek status video Bunny"),
+            BotCommand("queue", "Lihat antrean job"),
+            BotCommand("cancel", "Batalkan job (JOB_ID)"),
+            BotCommand("retry", "Ulangi job gagal (JOB_ID)"),
+            BotCommand("history", "10 job terakhir"),
+            BotCommand("list_files", "Isi folder downloads"),
+            BotCommand("delete_file", "Hapus file di downloads"),
+            BotCommand("clear_downloads", "Hapus semua file di downloads"),
+            BotCommand("storage", "Info storage"),
+            BotCommand("health", "Health check"),
+            BotCommand("config", "Tampilkan konfigurasi (tanpa secret)"),
+            BotCommand("backup_config", "Export konfigurasi aman"),
+        ]
+        try:
+            await self.application.bot.set_my_commands(commands)
+            log.info("Bot command menu di-publish (%d entri)", len(commands))
+        except Exception as exc:
+            log.warning("Gagal set_my_commands: %s", exc)
 
     # ---- command implementations ---------------------------------------- #
 
@@ -177,9 +242,11 @@ class BotApp:
             "<b>Daftar Command</b>\n"
             "/start — info bot\n"
             "/help — bantuan\n"
-            "/upload_bunny <i>Judul | URL</i> — download lalu upload ke Bunny Stream\n"
-            "/download <i>Judul | URL</i> — download saja (alias /download_only)\n"
-            "/download_only <i>Judul | URL</i> — download saja\n"
+            "/m <i>URL</i> — mirror: download lalu pilih tombol upload (Bunny / Player4Me)\n"
+            "/upload_bunny <i>[Judul |] URL</i> — download + upload ke Bunny Stream\n"
+            "/upload_player4me <i>[Judul |] URL</i> — download + upload ke Player4Me\n"
+            "/download <i>[Judul |] URL</i> — download saja (alias /download_only)\n"
+            "/download_only <i>[Judul |] URL</i> — download saja\n"
             "/status <i>VIDEO_ID</i> — cek status video Bunny\n"
             "/queue — lihat antrean\n"
             "/cancel <i>JOB_ID</i> — batalkan job\n"
@@ -191,7 +258,8 @@ class BotApp:
             "/storage — info storage\n"
             "/health — health check\n"
             "/config — tampilkan konfigurasi (tanpa secret)\n"
-            "/backup_config — export konfigurasi aman"
+            "/backup_config — export konfigurasi aman\n\n"
+            "<i>Kalau Judul tidak diberikan, judul otomatis diambil dari nama file di sumber.</i>"
         )
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -202,10 +270,245 @@ class BotApp:
         await self._enqueue_from_command(update, context, JobType.UPLOAD_BUNNY)
 
     @admin_only
+    async def cmd_upload_player4me(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._enqueue_from_command(update, context, JobType.UPLOAD_PLAYER4ME)
+
+    @admin_only
     async def cmd_download_only(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         await self._enqueue_from_command(update, context, JobType.DOWNLOAD_ONLY)
+
+    @admin_only
+    async def cmd_mirror(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """``/m URL`` — register a pending mirror and prompt for upload target."""
+        msg = update.effective_message
+        if not msg:
+            return
+        raw = (msg.text or "").split(maxsplit=1)
+        args = raw[1].strip() if len(raw) > 1 else ""
+        if not args:
+            await msg.reply_text(
+                "Format: /m URL\nContoh:\n/m https://drive.google.com/file/d/FILE_ID/view"
+            )
+            return
+
+        # Accept either a bare URL or 'Title | URL'.
+        title, url = parse_command_args(args)
+        if not url:
+            url = args.strip()
+            title = ""
+        if not is_url(url):
+            await msg.reply_text(
+                "URL tidak valid. Pastikan diawali http:// atau https://"
+            )
+            return
+
+        # Auto-detect title from Drive metadata when user didn't supply one.
+        title = (title or "").strip()
+        if not title:
+            title = await self._infer_title(url)
+
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        user = update.effective_user
+        user_id = user.id if user else 0
+
+        # 8 hex chars is plenty for callback uniqueness within this process.
+        pending_id = uuid.uuid4().hex[:8]
+        self._pending_mirror[pending_id] = (chat_id, user_id, title, url)
+
+        text = (
+            "<b>Tugas baru — pilih target upload</b>\n"
+            f"Judul: {html.escape(title)}\n"
+            f"URL: <code>{html.escape(url)}</code>\n\n"
+            "Klik tombol di bawah untuk memilih kemana file di-upload."
+        )
+        keyboard = self._mirror_keyboard(pending_id)
+        await msg.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
+    async def _infer_title(self, url: str) -> str:
+        """Derive a sensible title from the source URL (Drive metadata first)."""
+        try:
+            info = classify_link(
+                url,
+                allow_google_drive=self.cfg.download.allow_google_drive,
+                allow_direct=self.cfg.download.allow_direct_link,
+                allow_ytdlp=self.cfg.download.allow_ytdlp,
+            )
+        except ValueError:
+            return "Untitled"
+
+        if info.kind == "google_drive" and info.file_id:
+            client = GDriveAPIClient(self.cfg)
+            if client.is_configured():
+                try:
+                    meta = await client.get_metadata(info.file_id)
+                    name = str(meta.get("name") or "").strip()
+                    if name:
+                        # Strip extension so the queued title is clean.
+                        return Path(safe_filename(name)).stem or name
+                except Exception as exc:
+                    log.debug("infer_title gagal ambil meta Drive: %s", exc)
+
+        # Fallback: filename portion of the URL path.
+        from urllib.parse import unquote, urlparse
+
+        path = unquote(urlparse(url).path or "")
+        candidate = Path(path).name
+        if candidate:
+            stem = Path(safe_filename(candidate)).stem
+            if stem:
+                return stem
+        return "Untitled"
+
+    def _mirror_keyboard(self, pending_id: str) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        first_row: list[InlineKeyboardButton] = []
+        if (
+            self.cfg.upload_targets.bunny_stream_enabled
+            and self.bunny.is_configured()
+        ):
+            first_row.append(
+                InlineKeyboardButton(
+                    "\u25B6 Bunny Stream",
+                    callback_data=f"mirror:bunny:{pending_id}",
+                )
+            )
+        if (
+            self.cfg.upload_targets.player4me_enabled
+            and self.player4me.is_configured()
+        ):
+            first_row.append(
+                InlineKeyboardButton(
+                    "\u25B6 Player4Me",
+                    callback_data=f"mirror:player4me:{pending_id}",
+                )
+            )
+        if first_row:
+            rows.append(first_row)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\u2B07 Download saja",
+                    callback_data=f"mirror:download:{pending_id}",
+                ),
+                InlineKeyboardButton(
+                    "\u2715 Batal",
+                    callback_data=f"mirror:cancel:{pending_id}",
+                ),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    async def cb_mirror_choice(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle clicks on the /m inline keyboard."""
+        query = update.callback_query
+        if query is None or not query.data:
+            return
+
+        # Authorize the click via the same admin gate as command handlers.
+        cfg: AppConfig = context.application.bot_data["config"]
+        clicker = update.effective_user
+        if clicker is None or clicker.id not in cfg.secrets.admin_telegram_ids:
+            await query.answer("Akses ditolak.", show_alert=True)
+            return
+
+        try:
+            _, action, pending_id = query.data.split(":", 2)
+        except ValueError:
+            await query.answer("Callback tidak dikenali.", show_alert=True)
+            return
+
+        pending = self._pending_mirror.pop(pending_id, None)
+        if pending is None:
+            await query.answer(
+                "Pilihan kadaluarsa. Kirim ulang /m URL.", show_alert=True
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        chat_id, user_id, title, url = pending
+
+        if action == "cancel":
+            await query.answer("Dibatalkan.")
+            try:
+                await query.edit_message_text(
+                    f"<b>Mirror dibatalkan</b>\nJudul: {html.escape(title)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "bunny":
+            job_type = JobType.UPLOAD_BUNNY
+            target_label = "Bunny Stream"
+            if not self.bunny.is_configured():
+                await query.answer(
+                    "Bunny belum dikonfigurasi.", show_alert=True
+                )
+                return
+        elif action == "player4me":
+            job_type = JobType.UPLOAD_PLAYER4ME
+            target_label = "Player4Me"
+            if not self.player4me.is_configured():
+                await query.answer(
+                    "Player4Me belum dikonfigurasi.", show_alert=True
+                )
+                return
+        elif action == "download":
+            job_type = JobType.DOWNLOAD_ONLY
+            target_label = "Download saja"
+        else:
+            await query.answer("Aksi tidak dikenali.", show_alert=True)
+            return
+
+        await query.answer(f"Mulai: {target_label}")
+
+        job = await self.queue.enqueue(
+            job_type=job_type,
+            title=title,
+            source_url=url,
+            chat_id=chat_id,
+            user_id=user_id,
+            requested_by=(clicker.username or clicker.full_name)
+            if clicker
+            else None,
+        )
+
+        new_text = (
+            f"<b>Job {job.job_id} ditambahkan</b>\n"
+            f"Target: {target_label}\n"
+            f"Judul: {html.escape(title)}\n"
+            f"URL: <code>{html.escape(url)}</code>"
+        )
+        try:
+            await query.edit_message_text(
+                new_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            if query.message:
+                self._progress_msg[job.job_id] = (
+                    query.message.chat_id,
+                    query.message.message_id,
+                )
+        except Exception as exc:
+            log.debug("edit callback message failed: %s", exc)
 
     async def _enqueue_from_command(
         self,
@@ -219,12 +522,16 @@ class BotApp:
         raw = (msg.text or "").split(maxsplit=1)
         args = raw[1] if len(raw) > 1 else ""
         title, url = parse_command_args(args)
+        if not url and is_url(args.strip()):
+            url = args.strip()
+            title = ""
         if not url:
             await msg.reply_text(
                 "Format salah. Gunakan:\n"
-                "/upload_bunny Judul Video | https://link\n"
-                "atau\n"
-                "/download Judul | https://link"
+                "/upload_bunny Judul | https://link\n"
+                "/upload_player4me Judul | https://link\n"
+                "/download Judul | https://link\n\n"
+                "Judul opsional — kalau dikosongkan akan diambil dari nama file di sumber."
             )
             return
 
@@ -238,7 +545,26 @@ class BotApp:
             )
             return
 
-        title = title or "Untitled"
+        if (
+            job_type == JobType.UPLOAD_PLAYER4ME
+            and not self.cfg.upload_targets.player4me_enabled
+        ):
+            await msg.reply_text(
+                "Upload Player4Me dinonaktifkan di config.yaml."
+            )
+            return
+        if (
+            job_type == JobType.UPLOAD_PLAYER4ME
+            and not self.player4me.is_configured()
+        ):
+            await msg.reply_text(
+                "Player4Me belum dikonfigurasi (PLAYER4ME_API_TOKEN kosong)."
+            )
+            return
+
+        title = (title or "").strip()
+        if not title:
+            title = await self._infer_title(url)
         user = update.effective_user
         chat_id = update.effective_chat.id if update.effective_chat else None
 
@@ -414,6 +740,13 @@ class BotApp:
 
         net_ok, net_msg = await asyncio.to_thread(_check_internet)
         bunny_ok, bunny_msg = await self.bunny.health_check()
+        if self.player4me.is_configured():
+            p4m_ok, p4m_msg = await self.player4me.health_check()
+            p4m_line = (
+                f"Player4Me API: {'OK' if p4m_ok else 'FAIL'} ({p4m_msg})"
+            )
+        else:
+            p4m_line = "Player4Me API: tidak dikonfigurasi"
         gdrive_client = GDriveAPIClient(self.cfg)
         if gdrive_client.is_configured():
             gdrive_ok, gdrive_msg = await gdrive_client.health_check()
@@ -442,6 +775,7 @@ class BotApp:
             f"Python: {py_version}\n"
             f"Internet: {'OK' if net_ok else 'FAIL'} ({net_msg})\n"
             f"Bunny API: {'OK' if bunny_ok else 'FAIL'} ({bunny_msg})\n"
+            f"{p4m_line}\n"
             f"{gdrive_line}\n"
             f"FFmpeg: {'OK (' + ffmpeg_path + ')' if ffmpeg_path else 'tidak ditemukan (opsional)'}\n"
             "Folder:\n  " + "\n  ".join(folders)
@@ -516,14 +850,37 @@ class BotApp:
 
         if not is_uploadable_video(result.path, self.cfg):
             raise RuntimeError(
-                f"File {result.path.name} bukan video yang valid untuk Bunny "
+                f"File {result.path.name} bukan video yang valid "
                 f"(ekstensi tidak didukung)."
             )
 
+        if job.type == JobType.UPLOAD_BUNNY.value:
+            await self._run_upload_bunny(
+                job, result.path, progress, cancel_event
+            )
+        elif job.type == JobType.UPLOAD_PLAYER4ME.value:
+            await self._run_upload_player4me(
+                job, result.path, progress, cancel_event
+            )
+        else:
+            raise RuntimeError(f"Tipe job tidak dikenali: {job.type}")
+
+        # 3) Auto delete local file if configured
+        if self.cfg.app.auto_delete_after_upload:
+            safe_unlink(result.path)
+            log.info("Auto-deleted local file %s", result.path)
+
+    async def _run_upload_bunny(
+        self,
+        job: Job,
+        file_path: Path,
+        progress: Callable[[str, float | None, str], Awaitable[None]],
+        cancel_event: asyncio.Event,
+    ) -> None:
         try:
             video = await self.bunny.upload_full(
                 title=job.title,
-                file_path=result.path,
+                file_path=file_path,
                 progress_cb=progress,
                 cancel_event=cancel_event,
             )
@@ -541,10 +898,42 @@ class BotApp:
             progress_text=f"Upload selesai. Status Bunny: {video.status_text}",
         )
 
-        # 3) Auto delete local file if configured
-        if self.cfg.app.auto_delete_after_upload:
-            safe_unlink(result.path)
-            log.info("Auto-deleted local file %s", result.path)
+    async def _run_upload_player4me(
+        self,
+        job: Job,
+        file_path: Path,
+        progress: Callable[[str, float | None, str], Awaitable[None]],
+        cancel_event: asyncio.Event,
+    ) -> None:
+        folder_id = (
+            self.cfg.upload_targets.player4me_default_folder_id or None
+        )
+        try:
+            res = await self.player4me.upload_local_file(
+                file_path,
+                title=job.title,
+                folder_id=folder_id,
+                progress_cb=progress,
+                cancel_event=cancel_event,
+            )
+        except Player4MeError as exc:
+            raise RuntimeError(f"Upload Player4Me gagal: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Upload Player4Me gagal: {exc}") from exc
+
+        await self.queue._update(  # type: ignore[attr-defined]
+            job,
+            player4me_task_id=res.task_id,
+            player4me_video_id=res.primary_video_id,
+            player4me_status=res.status,
+            player4me_engine=res.engine,
+            status=JobStatus.COMPLETED,
+            finished_at=time.time(),
+            progress=100.0,
+            progress_text=(
+                f"Upload selesai. Player4Me ({res.engine}): {res.status}"
+            ),
+        )
 
     # ---- live progress notifications ------------------------------------ #
 
@@ -610,6 +999,21 @@ class BotApp:
                 f"Embed URL:\n{job.embed_url or '-'}\n\n"
                 f"CDN Hostname:\n{self.cfg.bunny.cdn_hostname}\n\n"
                 "Catatan:\nVideo mungkin masih encoding beberapa menit."
+            )
+        elif job.type == JobType.UPLOAD_PLAYER4ME.value:
+            engine_label = {
+                "advance_upload": "URL ingest (server-side)",
+                "tus": "TUS upload (lokal)",
+            }.get(job.player4me_engine or "", job.player4me_engine or "-")
+            text = (
+                "<b>Upload Player4Me Berhasil</b>\n\n"
+                f"Judul:\n{html.escape(job.title)}\n\n"
+                f"Engine:\n{html.escape(engine_label)}\n\n"
+                f"Status:\n{html.escape(job.player4me_status or '-')}\n\n"
+                f"Task ID:\n<code>{html.escape(job.player4me_task_id or '-')}</code>\n\n"
+                f"Video ID:\n<code>{html.escape(job.player4me_video_id or '-')}</code>\n\n"
+                "Catatan:\nVideo mungkin masih encoding beberapa menit "
+                "di player4me."
             )
         else:
             text = (

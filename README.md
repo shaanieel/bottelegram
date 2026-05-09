@@ -1,7 +1,7 @@
 # ZAEIN Automation Bot
 
 Bot Telegram automation untuk **download dari banyak sumber** lalu **upload ke
-Bunny Stream**, dengan **queue system**, log, retry, dan health-check.
+Bunny Stream / Player4Me**, dengan **queue system**, log, retry, dan health-check.
 
 Dibuat agar mudah dijalankan di **Windows RDP** maupun **Linux VPS**, modular,
 aman, dan siap dipindah-pindah server.
@@ -18,17 +18,18 @@ aman, dan siap dipindah-pindah server.
 6. [Ambil Telegram User ID Anda](#ambil-telegram-user-id-anda)
 7. [Ambil Bunny Stream API Key](#ambil-bunny-stream-api-key)
 8. [Setup Google Drive API (opsional, sangat direkomendasikan)](#setup-google-drive-api-opsional-sangat-direkomendasikan)
-9. [Install Dependency](#install-dependency)
-10. [Isi `.env` dan `config.yaml`](#isi-env-dan-configyaml)
-11. [Menjalankan Bot](#menjalankan-bot)
-12. [Daftar Command](#daftar-command)
-13. [Test Download dan Test Upload Bunny](#test-download-dan-test-upload-bunny)
-14. [Melihat Log](#melihat-log)
-15. [Memindahkan Server (VPS / RDP baru)](#memindahkan-server-vps--rdp-baru)
-16. [Backup Konfigurasi](#backup-konfigurasi)
-17. [Auto-start saat Startup](#auto-start-saat-startup)
-18. [Troubleshooting](#troubleshooting)
-19. [Keamanan](#keamanan)
+9. [Setup Player4Me API (opsional)](#setup-player4me-api-opsional)
+10. [Install Dependency](#install-dependency)
+11. [Isi `.env` dan `config.yaml`](#isi-env-dan-configyaml)
+12. [Menjalankan Bot](#menjalankan-bot)
+13. [Daftar Command](#daftar-command)
+14. [Test Download dan Test Upload Bunny](#test-download-dan-test-upload-bunny)
+15. [Melihat Log](#melihat-log)
+16. [Memindahkan Server (VPS / RDP baru)](#memindahkan-server-vps--rdp-baru)
+17. [Backup Konfigurasi](#backup-konfigurasi)
+18. [Auto-start saat Startup](#auto-start-saat-startup)
+19. [Troubleshooting](#troubleshooting)
+20. [Keamanan](#keamanan)
 
 ---
 
@@ -41,6 +42,11 @@ aman, dan siap dipindah-pindah server.
   `yt-dlp` kalau API tidak dikonfigurasi atau gagal.
 - Upload ke **Bunny Stream** menggunakan API resmi (create video, put binary,
   cek status), tanpa hardcode API key.
+- Upload ke **Player4Me** lewat protokol **TUS** (chunk 50 MiB, resumable).
+- Command pendek **`/m URL`** menampilkan tombol **Bunny Stream**, **Player4Me**,
+  atau **Download saja** — satu command untuk dua tujuan upload.
+- **Bot command menu**: ketik `/` di Telegram, daftar semua command muncul
+  otomatis lewat `setMyCommands`.
 - **Queue system** async: kirim banyak job sekaligus, semua antri tertib.
 - **Persistensi job** ke `data/jobs.json` (anti hilang setelah restart).
 - **Cancel** dan **retry** per job.
@@ -173,6 +179,42 @@ ffmpeg -version
 
 > Jangan ubah konfigurasi Pull Zone Bunny secara manual. Bot ini hanya
 > menggunakan **Bunny Stream API**.
+
+---
+
+## Setup Player4Me API (opsional)
+
+Kalau ingin pakai command `/m URL` dengan tombol **Player4Me** atau
+`/upload_player4me`, bot butuh API token Player4Me.
+
+1. Login ke <https://player4me.com/>.
+2. Buka menu **API** di dashboard Anda dan salin API token.
+3. Tempel ke `.env`:
+   ```
+   PLAYER4ME_API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+4. Restart bot, lalu kirim `/health`. Akan muncul baris seperti:
+
+   ```
+   Player4Me API: OK (OK)
+   ```
+
+Di `config.yaml` Anda bisa atur:
+
+```yaml
+upload_targets:
+  player4me:
+    enabled: true
+    prefer_url_ingest: true   # coba server-side fetch dulu untuk URL publik
+    default_folder_id: ""     # opsional: folder ID tujuan di Player4Me
+```
+
+**Engine upload Player4Me**: bot mengimplementasikan protokol **TUS 1.0.0**
+resmi mereka dengan **chunk 50 MiB** (52,428,800 byte) lewat aiohttp keep-alive
+— ini engine paling cepat untuk upload file lokal. Untuk URL ingest (server
+player4me yang fetch sendiri dari URL publik), endpoint
+`POST /api/v1/video/advance-upload` juga sudah dibungkus di
+`modules/player4me_uploader.py`.
 
 ---
 
@@ -389,9 +431,11 @@ bot Anda. Hanya `ADMIN_TELEGRAM_ID` yang dibalas.
 | --- | --- |
 | `/start` | Info bot dan panduan singkat. |
 | `/help` | Tampilkan semua command. |
-| `/upload_bunny Judul \| URL` | Download lalu upload ke Bunny Stream. |
-| `/download Judul \| URL` | Download saja (alias `/download_only`). |
-| `/download_only Judul \| URL` | Download saja, tanpa upload. |
+| `/m URL` | **Mirror**: download dari URL, lalu pilih tombol **Bunny Stream / Player4Me / Download saja**. Judul otomatis diambil dari nama file di sumber. |
+| `/upload_bunny [Judul \|] URL` | Download + upload ke Bunny Stream. Judul opsional. |
+| `/upload_player4me [Judul \|] URL` | Download + upload ke Player4Me (TUS). Judul opsional. |
+| `/download [Judul \|] URL` | Download saja (alias `/download_only`). |
+| `/download_only [Judul \|] URL` | Download saja, tanpa upload. |
 | `/status VIDEO_ID` | Cek status video di Bunny. |
 | `/queue` | Lihat antrean job. |
 | `/cancel JOB_ID` | Batalkan job. |
@@ -401,7 +445,7 @@ bot Anda. Hanya `ADMIN_TELEGRAM_ID` yang dibalas.
 | `/delete_file nama_file` | Hapus file tertentu di downloads. |
 | `/clear_downloads` | Hapus semua file di downloads. |
 | `/storage` | Total / terpakai / sisa storage. |
-| `/health` | Cek bot, internet, Bunny API, folder, FFmpeg, Python. |
+| `/health` | Cek bot, internet, Bunny API, Player4Me API, GDrive API, folder, FFmpeg, Python. |
 | `/config` | Tampilkan konfigurasi aktif (tanpa secret). |
 | `/backup_config` | Kirim file backup konfigurasi (tanpa API key). |
 
@@ -410,13 +454,20 @@ bot Anda. Hanya `ADMIN_TELEGRAM_ID` yang dibalas.
 ## Test Download dan Test Upload Bunny
 
 1. Pastikan bot sudah jalan dan Anda sudah dibalas saat `/start`.
-2. Tes download saja:
+2. Tes mirror dengan tombol pilihan upload:
+   ```
+   /m https://drive.google.com/file/d/<FILE_ID>/view
+   ```
+   Bot akan reply dengan tombol **Bunny Stream**, **Player4Me**, dan **Batal**.
+   Klik salah satu untuk memulai job. Judul otomatis diambil dari nama file di
+   Drive (lewat metadata API kalau dikonfigurasi).
+3. Tes download saja:
    ```
    /download_only Test Video | https://drive.google.com/file/d/<FILE_ID>/view
    ```
    Bot akan menambahkan job, mengirim progress, lalu memberitahu hasil
    download.
-3. Tes download + upload Bunny:
+4. Tes download + upload Bunny:
    ```
    /upload_bunny The Drama 2026 | https://drive.google.com/file/d/<FILE_ID>/view
    ```
@@ -431,10 +482,17 @@ bot Anda. Hanya `ADMIN_TELEGRAM_ID` yang dibalas.
    CDN Hostname: vz-eaddacc6-5f8.b-cdn.net
    ```
 
-4. Cek progress encoding kapan saja:
+5. Cek progress encoding kapan saja:
    ```
    /status <guid>
    ```
+
+6. Tes upload ke Player4Me langsung tanpa tombol:
+   ```
+   /upload_player4me https://drive.google.com/file/d/<FILE_ID>/view
+   ```
+   Setelah upload selesai bot akan kirim ringkasan dengan engine yang dipakai
+   (`TUS upload (lokal)` untuk file lokal).
 
 ---
 
@@ -540,6 +598,10 @@ journalctl -u zaein-bot.service -f
 | `GDriveAPI ... HTTP 403 (storageQuotaExceeded)` | Quota harian project Cloud habis. Tunggu reset, naikkan kuota, atau pakai service account lain. |
 | `/health` GDrive API FAIL `google-auth tidak terinstall` | Jalankan `pip install -r requirements.txt` ulang setelah update bot. |
 | `HTTP 401` saat upload Bunny | API key salah / library ID salah. Cek dashboard Bunny. |
+| Player4Me HTTP 401 | `PLAYER4ME_API_TOKEN` salah / kedaluwarsa. Generate ulang di dashboard player4me. |
+| Player4Me "belum dikonfigurasi" | Isi `PLAYER4ME_API_TOKEN` di `.env`, lalu restart bot. |
+| Tombol /m kadaluarsa | Kirim ulang `/m URL`. Pending button ID disimpan in-memory — hilang setelah restart. |
+| Command `/` tidak muncul saran | Tunggu beberapa detik setelah bot start (Telegram cache `setMyCommands`), atau tutup-buka chat bot. |
 | Upload mentok di "Processing" | Wajar untuk video besar. Cek dengan `/status VIDEO_ID`. |
 | Storage penuh | Jalankan `/clear_downloads` atau aktifkan `auto_delete_after_upload`. |
 | `yt-dlp` butuh FFmpeg | Install FFmpeg (lihat seksi di atas). |
