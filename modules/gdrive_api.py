@@ -1,13 +1,19 @@
 """Google Drive API v3 client used as the preferred Drive download engine.
 
-Two auth modes are supported, in this priority order:
+Three auth modes are supported, in this priority order:
 
-1. **Service Account** (``GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`` in .env points to
-   a JSON key file). Works for public files, and for any file/folder/Shared
-   Drive that has been explicitly shared with the service account email.
-2. **API Key** (``GOOGLE_DRIVE_API_KEY`` in .env). Public files only.
+1. **OAuth user token** (``GOOGLE_DRIVE_OAUTH_TOKEN_PATH`` in .env points to
+   a pickle/JSON file produced by ``tools/generate_drive_token.py``). Acts as
+   the logged-in Google user, so it can read **any** file the user can read
+   in their browser, including their own private files. Equivalent to the
+   ``token.pickle`` flow used by Pikabot / mirror-leech-telegram-bot.
+2. **Service Account** (``GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`` in .env points
+   to a JSON key file). Works for public files, and for any file/folder/
+   Shared Drive that has been explicitly shared with the service account
+   email.
+3. **API Key** (``GOOGLE_DRIVE_API_KEY`` in .env). Public files only.
 
-When neither is configured the client reports ``is_configured() == False`` and
+When none is configured the client reports ``is_configured() == False`` and
 the downloader falls back to ``gdown``.
 """
 
@@ -16,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import pickle
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -47,14 +54,24 @@ class GDriveAPIClient:
         self.cfg = cfg
         self._api_key = cfg.secrets.google_drive_api_key
         self._sa_json_path = cfg.secrets.google_drive_service_account_json
-        # cached service-account access token
+        self._oauth_token_path = cfg.secrets.google_drive_oauth_token_path
+        # cached access token (works for both service-account and oauth)
         self._access_token: str | None = None
         self._access_token_exp: float = 0.0
 
     # ----- configuration helpers ------------------------------------------- #
 
     def is_configured(self) -> bool:
-        return self.has_service_account() or bool(self._api_key)
+        return (
+            self.has_oauth_token()
+            or self.has_service_account()
+            or bool(self._api_key)
+        )
+
+    def has_oauth_token(self) -> bool:
+        if not self._oauth_token_path:
+            return False
+        return Path(self._oauth_token_path).expanduser().is_file()
 
     def has_service_account(self) -> bool:
         if not self._sa_json_path:
@@ -62,53 +79,103 @@ class GDriveAPIClient:
         return Path(self._sa_json_path).expanduser().is_file()
 
     def auth_mode(self) -> str:
+        # OAuth user token takes priority over service-account because it's
+        # the explicit "log in as me" choice; SA still wins over bare API key.
+        if self.has_oauth_token():
+            return "oauth_user"
         if self.has_service_account():
             return "service_account"
         if self._api_key:
             return "api_key"
         return "disabled"
 
-    # ----- access token (service account) ---------------------------------- #
+    # ----- access token (oauth user / service account) --------------------- #
 
     async def _get_access_token(self) -> str:
         if self._access_token and self._access_token_exp - 60 > time.time():
             return self._access_token
 
-        if not self.has_service_account():
-            raise GDriveAPIError("Service account JSON tidak dikonfigurasi")
-
         try:
             from google.auth.transport.requests import Request  # type: ignore
-            from google.oauth2 import service_account  # type: ignore
         except ImportError as exc:  # pragma: no cover - exercised on missing dep
             raise GDriveAPIError(
                 "Library `google-auth` tidak terinstall. "
                 "Jalankan: pip install google-auth"
             ) from exc
 
-        sa_path = str(Path(self._sa_json_path).expanduser())
-
-        def _refresh() -> tuple[str, float]:
-            creds = service_account.Credentials.from_service_account_file(
-                sa_path, scopes=[OAUTH_SCOPE]
+        if self.has_oauth_token():
+            token, exp = await asyncio.to_thread(self._refresh_oauth_token, Request)
+        elif self.has_service_account():
+            token, exp = await asyncio.to_thread(
+                self._refresh_service_account, Request
             )
-            creds.refresh(Request())
-            exp = creds.expiry.timestamp() if creds.expiry else time.time() + 3600
-            return creds.token, exp
+        else:
+            raise GDriveAPIError(
+                "Tidak ada OAuth token / Service Account dikonfigurasi"
+            )
 
-        token, exp = await asyncio.to_thread(_refresh)
         self._access_token = token
         self._access_token_exp = exp
         return token
 
+    def _refresh_oauth_token(self, Request: Any) -> tuple[str, float]:  # noqa: N803
+        """Load (and refresh) an OAuth user credential from disk.
+
+        Supports both ``token.pickle`` (compatible with the MLTB / Pikabot
+        ecosystem) and a JSON file produced by ``Credentials.to_json()``.
+        """
+        try:
+            from google.oauth2.credentials import Credentials  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise GDriveAPIError(
+                "Library `google-auth` tidak terinstall. "
+                "Jalankan: pip install google-auth"
+            ) from exc
+
+        path = Path(self._oauth_token_path).expanduser()
+        creds: Any = _load_oauth_credentials(path, Credentials)
+        if creds is None:
+            raise GDriveAPIError(
+                f"OAuth token kosong / korup: {path}"
+            )
+        if not getattr(creds, "valid", False):
+            if getattr(creds, "expired", False) and getattr(
+                creds, "refresh_token", None
+            ):
+                creds.refresh(Request())
+                _save_oauth_credentials(path, creds)
+            else:
+                raise GDriveAPIError(
+                    "OAuth token expired dan tidak ada refresh_token. "
+                    "Jalankan ulang: python tools/generate_drive_token.py"
+                )
+        exp = creds.expiry.timestamp() if creds.expiry else time.time() + 3300
+        return creds.token, exp
+
+    def _refresh_service_account(self, Request: Any) -> tuple[str, float]:  # noqa: N803
+        try:
+            from google.oauth2 import service_account  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise GDriveAPIError(
+                "Library `google-auth` tidak terinstall. "
+                "Jalankan: pip install google-auth"
+            ) from exc
+        sa_path = str(Path(self._sa_json_path).expanduser())
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=[OAUTH_SCOPE]
+        )
+        creds.refresh(Request())
+        exp = creds.expiry.timestamp() if creds.expiry else time.time() + 3600
+        return creds.token, exp
+
     async def _auth_headers(self) -> dict[str, str]:
-        if self.has_service_account():
+        if self.has_oauth_token() or self.has_service_account():
             token = await self._get_access_token()
             return {"Authorization": f"Bearer {token}"}
         return {}
 
     def _params(self, base: dict[str, str]) -> dict[str, str]:
-        if self.has_service_account():
+        if self.has_oauth_token() or self.has_service_account():
             return base
         if self._api_key:
             return {**base, "key": self._api_key}
@@ -137,10 +204,29 @@ class GDriveAPIClient:
                         _format_api_error("metadata", resp.status, body)
                     )
                 if resp.status == 404:
+                    mode = self.auth_mode()
+                    if mode == "api_key":
+                        raise GDriveAPIError(
+                            "File tidak ditemukan (HTTP 404). "
+                            "API Key Google hanya bisa membaca file PUBLIC "
+                            "('Anyone with the link'). Untuk file private "
+                            "pakai OAuth user token (jalankan "
+                            "`python tools/generate_drive_token.py` lalu set "
+                            "GOOGLE_DRIVE_OAUTH_TOKEN_PATH di .env), atau "
+                            "Service Account, atau ubah file ke 'Anyone with "
+                            "the link' di Drive."
+                        )
+                    if mode == "oauth_user":
+                        raise GDriveAPIError(
+                            "File tidak ditemukan (HTTP 404). Akun Google "
+                            "yang Anda pakai untuk OAuth token tidak punya "
+                            "akses ke file ini. Pastikan login dengan akun "
+                            "yang memiliki / di-share file tersebut."
+                        )
                     raise GDriveAPIError(
-                        "File tidak ditemukan / tidak diizinkan untuk akun ini "
-                        "(404). Untuk file private, share dulu ke email service "
-                        "account."
+                        "File tidak ditemukan / tidak diizinkan untuk service "
+                        "account ini (HTTP 404). Share file ke email service "
+                        "account dengan akses minimum Viewer."
                     )
                 if resp.status >= 400:
                     raise GDriveAPIError(
@@ -157,6 +243,14 @@ class GDriveAPIClient:
         """Light probe used by ``/health``."""
         if not self.is_configured():
             return False, "Tidak dikonfigurasi"
+        if self.has_oauth_token():
+            try:
+                await self._get_access_token()
+                return True, "OAuth user token OK (akses semua Drive Anda)"
+            except GDriveAPIError as exc:
+                return False, str(exc)
+            except Exception as exc:  # pragma: no cover
+                return False, f"OAuth token error: {exc}"
         if self.has_service_account():
             try:
                 await self._get_access_token()
@@ -309,3 +403,44 @@ async def _emit(
             await result
     except Exception as exc:  # progress callbacks must never break the download
         log.debug("progress_cb raised %s", exc)
+
+
+def _load_oauth_credentials(path: Path, Credentials: Any) -> Any:  # noqa: N803
+    """Load Google OAuth credentials from a ``.pickle`` or ``.json`` file.
+
+    Pickle is the format MLTB / Pikabot use (``token.pickle``). JSON is the
+    format produced by ``Credentials.to_json()``. We try pickle first, then
+    fall back to JSON, so users can drop in either kind.
+    """
+    raw = path.read_bytes()
+    # Try pickle first — most existing setups use it.
+    try:
+        creds = pickle.loads(raw)
+        # Trust only objects that quack like google.oauth2 Credentials.
+        if hasattr(creds, "refresh") and hasattr(creds, "token"):
+            return creds
+    except Exception:
+        pass
+    # Fallback: assume JSON (utf-8) produced by Credentials.to_json().
+    try:
+        info = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GDriveAPIError(
+            f"OAuth token tidak bisa di-decode (bukan pickle / JSON valid): {exc}"
+        ) from exc
+    return Credentials.from_authorized_user_info(info)
+
+
+def _save_oauth_credentials(path: Path, creds: Any) -> None:
+    """Persist refreshed OAuth credentials back to disk in their original format."""
+    suffix = path.suffix.lower()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if suffix == ".json":
+            path.write_text(creds.to_json(), encoding="utf-8")
+        else:
+            with path.open("wb") as f:
+                pickle.dump(creds, f)
+    except OSError as exc:
+        # Non-fatal: token is still valid in memory for this run.
+        log.warning("Tidak bisa menyimpan OAuth token ter-refresh ke %s: %s", path, exc)

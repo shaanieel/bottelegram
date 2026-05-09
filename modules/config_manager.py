@@ -95,6 +95,7 @@ class Secrets:
     bunny_api_key: str = ""
     google_drive_api_key: str = ""
     google_drive_service_account_json: str = ""
+    google_drive_oauth_token_path: str = ""
     player4me_api_token: str = ""
 
     def values_to_redact(self) -> list[str]:
@@ -178,6 +179,9 @@ class AppConfig:
             "gdrive_api_key_set": bool(self.secrets.google_drive_api_key),
             "gdrive_service_account_set": bool(
                 self.secrets.google_drive_service_account_json
+            ),
+            "gdrive_oauth_token_set": bool(
+                self.secrets.google_drive_oauth_token_path
             ),
             "player4me_api_token_set": bool(self.secrets.player4me_api_token),
         }
@@ -315,6 +319,9 @@ def load_config(
         google_drive_api_key=os.getenv("GOOGLE_DRIVE_API_KEY", "").strip(),
         google_drive_service_account_json=os.getenv(
             "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", ""
+        ).strip(),
+        google_drive_oauth_token_path=os.getenv(
+            "GOOGLE_DRIVE_OAUTH_TOKEN_PATH", ""
         ).strip(),
         player4me_api_token=os.getenv("PLAYER4ME_API_TOKEN", "").strip(),
     )
