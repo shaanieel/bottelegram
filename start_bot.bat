@@ -7,8 +7,9 @@ REM
 REM Yang dilakukan:
 REM   1. cd ke folder script (tidak peduli dari mana di-launch)
 REM   2. cek venv dan .env, kasih pesan jelas kalau belum di-setup
-REM   3. activate venv, jalankan bot
-REM   4. auto-restart (max 5x dalam 1 menit) kalau bot crash
+REM   3. sync requirements.txt ke venv (idempotent, cepat kalau sudah up-to-date)
+REM   4. jalankan bot pakai venv\Scripts\python.exe (tidak butuh `activate`)
+REM   5. auto-restart (max 5x) kalau bot crash
 REM
 REM Tutup jendela ini untuk stop bot.
 REM ============================================================================
@@ -42,8 +43,20 @@ if not exist ".env" (
     exit /b 1
 )
 
+if exist "requirements.txt" (
+    echo [%DATE% %TIME%] Sync dependency dari requirements.txt...
+    "venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt
+    if errorlevel 1 (
+        echo [WARN] pip install gagal. Bot tetap dijalankan dengan dependency yang sudah ada.
+        echo        Kalau bot error 'ModuleNotFoundError', jalankan manual:
+        echo            venv\Scripts\activate
+        echo            pip install -r requirements.txt
+    ) else (
+        echo [OK] Dependency siap.
+    )
+)
+
 set RESTART_COUNT=0
-set WINDOW_START=%TIME%
 
 :run
 echo.
