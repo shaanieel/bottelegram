@@ -7,8 +7,9 @@
 # Yang dilakukan:
 #   1. cd ke folder script (tidak peduli di-launch dari mana)
 #   2. cek venv dan .env, kasih pesan jelas kalau belum di-setup
-#   3. activate venv, jalankan bot
-#   4. auto-restart (max 5x) kalau bot crash
+#   3. sync requirements.txt ke venv (idempotent, cepat kalau sudah up-to-date)
+#   4. jalankan bot pakai venv/bin/python (tidak butuh `source activate`)
+#   5. auto-restart (max 5x) kalau bot crash
 #
 # Hentikan dengan Ctrl+C.
 # =============================================================================
@@ -31,6 +32,18 @@ if [ ! -f ".env" ]; then
     echo "[ERROR] File .env tidak ditemukan."
     echo "        cp .env.example .env  &&  edit .env"
     exit 1
+fi
+
+if [ -f "requirements.txt" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sync dependency dari requirements.txt..."
+    if ./venv/bin/python -m pip install --quiet --disable-pip-version-check -r requirements.txt; then
+        echo "[OK] Dependency siap."
+    else
+        echo "[WARN] pip install gagal. Bot tetap dijalankan dengan dependency yang sudah ada."
+        echo "       Kalau bot error 'ModuleNotFoundError', jalankan manual:"
+        echo "           source venv/bin/activate"
+        echo "           pip install -r requirements.txt"
+    fi
 fi
 
 # Forward Ctrl+C to the bot child process so it can shut down cleanly.
