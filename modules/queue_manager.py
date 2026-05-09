@@ -27,6 +27,14 @@ log = get_logger(__name__)
 class JobType(str, Enum):
     UPLOAD_BUNNY = "upload_bunny"
     UPLOAD_PLAYER4ME = "upload_player4me"
+    # Variant of UPLOAD_PLAYER4ME that extracts embedded subs from the source
+    # video (mkv/mp4) with ffmpeg and uploads each as a separate subtitle on
+    # Player4Me after the video upload completes.
+    UPLOAD_PLAYER4ME_SUBS = "upload_player4me_subs"
+    # Variant of UPLOAD_PLAYER4ME that takes a Drive *folder* URL: lists the
+    # folder, downloads the video + every sidecar subtitle file individually,
+    # uploads the video first, then attaches each subtitle.
+    UPLOAD_PLAYER4ME_FOLDER = "upload_player4me_folder"
     DOWNLOAD_ONLY = "download_only"
 
 

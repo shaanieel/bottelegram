@@ -64,6 +64,18 @@ class Player4MeUploadResult:
         return self.video_ids[0] if self.video_ids else None
 
 
+@dataclass
+class Player4MeSubtitleResult:
+    """Outcome of one ``PUT /video/manage/{id}/subtitle`` call."""
+
+    video_id: str
+    language: str
+    name: str
+    file_name: str
+    url: Optional[str]   # Player4Me sometimes returns the public URL
+    raw: dict[str, Any]
+
+
 # --------------------------------------------------------------------------- #
 
 
@@ -481,6 +493,225 @@ class Player4MeUploader:
                         )
         return offset
 
+    # ---- video listing + subtitle upload -------------------------------- #
+
+    async def list_videos(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 30,
+        folder_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Return a page of videos from ``GET /video/manage`` (newest first)."""
+        self._require_config()
+        if folder_id:
+            url = f"{self._api_base}/video/folder/{folder_id}"
+        else:
+            url = f"{self._api_base}/video/manage"
+        params = {
+            "page": str(page),
+            "perPage": str(per_page),
+            "sort": "createdAt",
+            "order": "desc",
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                url,
+                params=params,
+                headers=self._headers_json(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await self._read_json(resp)
+                if resp.status >= 400 or not isinstance(body, dict):
+                    raise Player4MeError(
+                        self._format_error("list videos", resp.status, body)
+                    )
+                data = body.get("data") or []
+                if not isinstance(data, list):
+                    return []
+                return [v for v in data if isinstance(v, dict)]
+
+    async def find_recent_video_by_name(
+        self,
+        name: str,
+        *,
+        folder_id: Optional[str] = None,
+        existing_ids: Optional[set[str]] = None,
+        max_pages: int = 3,
+        per_page: int = 50,
+    ) -> Optional[dict[str, Any]]:
+        """Locate a video by ``name`` (or "first new id since *existing_ids*").
+
+        TUS upload does not return the new ``videoId`` directly. The recommended
+        recovery path per Player4Me docs is to list ``/video/manage`` (which is
+        sorted newest-first) and find the entry that matches the filename we
+        just uploaded. To make that robust we also accept a ``existing_ids``
+        snapshot taken *before* the upload — anything not in the set is
+        considered new.
+        """
+        target = (name or "").strip().lower()
+        for page in range(1, max_pages + 1):
+            try:
+                videos = await self.list_videos(
+                    page=page, per_page=per_page, folder_id=folder_id
+                )
+            except Player4MeError:
+                if page == 1:
+                    raise
+                break
+            if not videos:
+                break
+            # Strategy 1: name match (case-insensitive, ignore extension).
+            if target:
+                base = Path(target).stem
+                for v in videos:
+                    raw_name = str(v.get("name") or "").lower()
+                    if not raw_name:
+                        continue
+                    if (
+                        raw_name == target
+                        or Path(raw_name).stem == base
+                        or base in raw_name
+                    ):
+                        return v
+            # Strategy 2: first id we have not seen before.
+            if existing_ids is not None:
+                for v in videos:
+                    vid = str(v.get("id") or "")
+                    if vid and vid not in existing_ids:
+                        return v
+            if len(videos) < per_page:
+                break
+        return None
+
+    async def snapshot_video_ids(
+        self,
+        *,
+        folder_id: Optional[str] = None,
+        max_pages: int = 2,
+        per_page: int = 50,
+    ) -> set[str]:
+        """Return the set of recent video IDs (used to diff post-TUS uploads)."""
+        ids: set[str] = set()
+        for page in range(1, max_pages + 1):
+            try:
+                videos = await self.list_videos(
+                    page=page, per_page=per_page, folder_id=folder_id
+                )
+            except Player4MeError:
+                break
+            if not videos:
+                break
+            for v in videos:
+                vid = str(v.get("id") or "")
+                if vid:
+                    ids.add(vid)
+            if len(videos) < per_page:
+                break
+        return ids
+
+    async def upload_subtitle(
+        self,
+        video_id: str,
+        file_path: str | Path,
+        *,
+        language: str,
+        name: Optional[str] = None,
+    ) -> Player4MeSubtitleResult:
+        """Upload one subtitle file via ``PUT /video/manage/{id}/subtitle``.
+
+        Player4Me requires:
+          - ``language`` — 2-char ISO 639-1 (e.g. ``id``, ``en``, ``ja``)
+          - ``file`` — the .srt / .ass / .vtt file as multipart/form-data
+          - ``name`` — optional human-readable label (defaults to the language)
+        """
+        self._require_config()
+        if not video_id:
+            raise Player4MeError("upload_subtitle: video_id kosong")
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            raise Player4MeError(f"Subtitle tidak ditemukan: {path}")
+        if path.stat().st_size == 0:
+            raise Player4MeError(f"Subtitle kosong: {path}")
+        lang = (language or "").strip().lower()
+        if len(lang) != 2 or not lang.isalpha():
+            raise Player4MeError(
+                f"language harus 2-huruf ISO 639-1 (id/en/ja/...), bukan {language!r}"
+            )
+        label = name or lang.upper()
+        endpoint = f"{self._api_base}/video/manage/{video_id}/subtitle"
+
+        # ``aiohttp.FormData`` builds the multipart body with the right
+        # ``Content-Type: multipart/form-data; boundary=…`` automatically.
+        form = aiohttp.FormData()
+        form.add_field("language", lang)
+        form.add_field("name", label)
+        ct = _subtitle_mime_for(path)
+        # ``aiohttp`` keeps the file handle open for the duration of the request;
+        # we open it inside an ``async with`` so it is cleaned up on errors too.
+        with path.open("rb") as fh:
+            form.add_field(
+                "file",
+                fh,
+                filename=path.name,
+                content_type=ct,
+            )
+            headers = {
+                "api-token": self._api_token,
+                "accept": "application/json",
+            }
+            log.info(
+                "Player4Me subtitle upload: video=%s lang=%s file=%s (%s bytes)",
+                video_id,
+                lang,
+                path.name,
+                path.stat().st_size,
+            )
+            async with aiohttp.ClientSession() as s:
+                try:
+                    async with s.put(
+                        endpoint,
+                        data=form,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                        allow_redirects=False,
+                    ) as resp:
+                        body = await self._read_json(resp)
+                        if resp.status in (301, 302, 303, 307, 308):
+                            redirect = resp.headers.get("Location") or resp.headers.get(
+                                "location"
+                            )
+                            raise Player4MeError(
+                                f"Subtitle upload HTTP {resp.status} redirect ke "
+                                f"{redirect!r} dari {endpoint!r}"
+                            )
+                        if resp.status >= 400:
+                            raise Player4MeError(
+                                self._format_error(
+                                    f"upload subtitle [{endpoint}]",
+                                    resp.status,
+                                    body,
+                                )
+                            )
+                        url_value: Optional[str] = None
+                        raw: dict[str, Any] = {}
+                        if isinstance(body, dict):
+                            raw = body
+                            url_value = body.get("url")
+                        return Player4MeSubtitleResult(
+                            video_id=video_id,
+                            language=lang,
+                            name=label,
+                            file_name=path.name,
+                            url=str(url_value) if url_value else None,
+                            raw=raw,
+                        )
+                except aiohttp.ClientError as exc:
+                    raise Player4MeError(
+                        f"Subtitle upload network error ({endpoint}): "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+
     # ---- internal: misc ------------------------------------------------- #
 
     def _require_config(self) -> None:
@@ -541,6 +772,19 @@ def _guess_mime(path: Path) -> str:
 
     guess, _ = mimetypes.guess_type(path.name)
     return guess or "application/octet-stream"
+
+
+_SUBTITLE_MIME_BY_EXT = {
+    ".srt": "application/x-subrip",
+    ".ass": "text/x-ssa",
+    ".ssa": "text/x-ssa",
+    ".vtt": "text/vtt",
+    ".sub": "text/plain",
+}
+
+
+def _subtitle_mime_for(path: Path) -> str:
+    return _SUBTITLE_MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
 
 
 async def _emit(
