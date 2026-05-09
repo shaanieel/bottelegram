@@ -27,15 +27,10 @@ log = get_logger(__name__)
 class JobType(str, Enum):
     UPLOAD_BUNNY = "upload_bunny"
     UPLOAD_PLAYER4ME = "upload_player4me"
-    # Variant of UPLOAD_PLAYER4ME that extracts embedded subs from the source
-    # video (mkv/mp4) with ffmpeg and uploads each as a separate subtitle on
-    # Player4Me after the video upload completes.
     UPLOAD_PLAYER4ME_SUBS = "upload_player4me_subs"
-    # Variant of UPLOAD_PLAYER4ME that takes a Drive *folder* URL: lists the
-    # folder, downloads the video + every sidecar subtitle file individually,
-    # uploads the video first, then attaches each subtitle.
     UPLOAD_PLAYER4ME_FOLDER = "upload_player4me_folder"
     DOWNLOAD_ONLY = "download_only"
+    MIRROR_GDRIVE = "mirror_gdrive"
 
 
 class JobStatus(str, Enum):
@@ -74,19 +69,19 @@ class Job:
     player4me_video_id: Optional[str] = None
     player4me_status: Optional[str] = None
     player4me_engine: Optional[str] = None
+    gdrive_file_id: Optional[str] = None
+    gdrive_web_link: Optional[str] = None
+    tgindex_keyword: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Job":
-        # Ignore unknown keys for forward compatibility
         valid = {k: data[k] for k in cls.__dataclass_fields__ if k in data}
         return cls(**valid)
 
 
-# Worker is a function that runs the job to completion. The QueueManager creates
-# and passes a per-job ``cancel_event`` plus a ``progress`` coroutine.
 WorkerFn = Callable[
     [Job, asyncio.Event, "ProgressFn"],
     Awaitable[None],
@@ -110,7 +105,7 @@ class QueueManager:
         self._on_status_change = on_status_change
 
         self._jobs: dict[str, Job] = {}
-        self._order: list[str] = []  # insertion order
+        self._order: list[str] = []
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._workers_running = False
@@ -344,7 +339,6 @@ class QueueManager:
                 job = Job.from_dict(raw)
             except TypeError:
                 continue
-            # Anything that was in-flight at last shutdown is marked failed.
             in_flight = {
                 JobStatus.DOWNLOADING.value,
                 JobStatus.DOWNLOADED.value,
@@ -358,7 +352,6 @@ class QueueManager:
                 job.finished_at = time.time()
             self._jobs[job.job_id] = job
             self._order.append(job.job_id)
-        # Prune to last N jobs to keep file small
         self._prune()
 
     def _prune(self) -> None:
