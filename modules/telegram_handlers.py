@@ -212,7 +212,30 @@ class BotApp:
 
     @staticmethod
     async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        log.exception("Unhandled error: %s", context.error)
+        # ``Conflict`` is raised once per long-poll cycle when another bot
+        # process is already calling ``getUpdates`` with the same token.
+        # The traceback adds no value (it's the same every time) so we
+        # collapse it to a single throttled WARNING line. Real bugs still
+        # get the full stack trace via ``log.exception``.
+        try:
+            from telegram.error import Conflict, NetworkError, TimedOut
+        except ImportError:
+            Conflict = NetworkError = TimedOut = ()  # type: ignore[assignment]
+        err = context.error
+        if isinstance(err, Conflict):
+            now = time.monotonic()
+            last = getattr(BotApp, "_last_conflict_log_at", 0.0)
+            if now - last > 60:
+                BotApp._last_conflict_log_at = now
+                log.warning(
+                    "Telegram getUpdates conflict: instance bot lain pakai "
+                    "token yang sama. Pastikan hanya 1 'python bot.py' jalan."
+                )
+            return
+        if isinstance(err, (NetworkError, TimedOut)):
+            log.warning("Telegram network hiccup: %s", err)
+            return
+        log.exception("Unhandled error: %s", err)
 
     async def cmd_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cfg: AppConfig = context.application.bot_data["config"]
