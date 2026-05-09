@@ -230,9 +230,48 @@ kelebihan dibanding scraping HTML lewat `gdown`:
   di-share ke service account bisa di-download tanpa "Anyone with the link".
 - **Lebih cepat** untuk file besar.
 
-Ada dua mode auth, pilih sesuai kebutuhan:
+Ada **tiga** mode auth, pilih sesuai kebutuhan. Prioritas runtime jika lebih
+dari satu di-set: **OAuth user > Service Account > API Key**.
 
-### Mode A — API Key (paling cepat setup, cuma untuk file PUBLIC)
+### Mode A — OAuth user token (TERBAIK untuk file private Anda sendiri)
+
+Pendekatan ini sama dengan yang dipakai Pikabot / mirror-leech-telegram-bot:
+Anda login ke akun Google sekali lewat browser, dan bot disimpan token-nya.
+Setelah itu bot bisa baca **semua file Anda** (termasuk private), karena
+request ke Drive API dilakukan **sebagai Anda**, bukan sebagai pemegang
+API key anonim.
+
+1. Buka <https://console.cloud.google.com/apis/credentials>.
+2. **CREATE CREDENTIALS** -> **OAuth client ID**. Kalau diminta, isi OAuth
+   consent screen dulu (cukup External -> nama app bebas -> simpan).
+3. Application type: **Desktop app**. Beri nama bebas, klik **Create**.
+4. Klik **DOWNLOAD JSON** pada client yang baru. Simpan ke
+   `secrets/credentials.json` (folder `secrets/` sudah di `.gitignore`).
+5. (Sekali saja) jalankan helper untuk login dan generate token:
+   ```bash
+   python tools/generate_drive_token.py
+   ```
+   Browser akan terbuka, login ke akun Google Anda, klik **Allow**. Helper
+   akan menulis `secrets/token.pickle`. Pakai `--no-browser` kalau VPS
+   headless (akan kasih URL untuk dibuka di browser lokal).
+6. Tempel path ke `.env`:
+   ```
+   GOOGLE_DRIVE_OAUTH_TOKEN_PATH=secrets/token.pickle
+   ```
+7. Restart bot. Kirim `/health`, harus muncul:
+   ```
+   GDrive API: OK [oauth_user] (OAuth user token OK (akses semua Drive Anda))
+   ```
+
+Token otomatis di-refresh oleh bot pakai `refresh_token`. Anda hanya perlu
+jalankan `generate_drive_token.py` lagi kalau Anda revoke akses lewat
+<https://myaccount.google.com/permissions> atau hapus `token.pickle`.
+
+> Sudah punya `token.pickle` dari Pikabot/MLTB? Bisa langsung pakai. Tinggal
+> copy file-nya ke `secrets/token.pickle` dan set
+> `GOOGLE_DRIVE_OAUTH_TOKEN_PATH`. Format pickle dan JSON dua-duanya didukung.
+
+### Mode B — API Key (paling cepat setup, cuma untuk file PUBLIC)
 
 1. Buka <https://console.cloud.google.com/apis/credentials>.
 2. Buat / pilih sebuah project.
@@ -249,7 +288,7 @@ Ada dua mode auth, pilih sesuai kebutuhan:
 API key hanya bekerja untuk file dengan akses "Anyone with the link". File
 benar-benar private akan return 404.
 
-### Mode B — Service Account (file PUBLIC + PRIVATE)
+### Mode C — Service Account (file PUBLIC + PRIVATE yang di-share ke SA)
 
 1. Di Cloud Console yang sama, **IAM & Admin** -> **Service Accounts** ->
    **Create Service Account**.
@@ -286,9 +325,9 @@ atau jika tidak dikonfigurasi:
 GDrive API: tidak dikonfigurasi (fallback ke gdown)
 ```
 
-> Tidak perlu set keduanya. Service account dipakai duluan kalau ada, kalau
-> tidak baru API key. Kalau dua-duanya kosong, bot otomatis pakai `gdown`
-> seperti sebelumnya.
+> Tidak perlu set semua. Prioritas: OAuth user > Service Account > API Key.
+> Kalau semua kosong, bot otomatis pakai `gdown` (lalu fallback ke direct
+> uc-download) seperti sebelumnya.
 
 ---
 
