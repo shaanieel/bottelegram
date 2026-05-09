@@ -78,9 +78,12 @@ class UploadTargetsSection:
     local_only_enabled: bool = True
     player4me_prefer_url_ingest: bool = True
     player4me_default_folder_id: str = ""
-    # 2-char ISO 639-1 fallback when ffprobe/filename heuristics can't
-    # determine a subtitle's language. Default is Indonesian.
     player4me_default_subtitle_language: str = "id"
+
+
+@dataclass
+class GDriveUploadSection:
+    default_folder_id: str = ""
 
 
 @dataclass
@@ -118,6 +121,7 @@ class AppConfig:
     bunny: BunnySection
     download: DownloadSection
     upload_targets: UploadTargetsSection
+    gdrive_upload: GDriveUploadSection
     logging: LoggingSection
     video_extensions: tuple[str, ...]
     secrets: Secrets
@@ -172,6 +176,9 @@ class AppConfig:
                     ),
                 },
                 "local_only": {"enabled": self.upload_targets.local_only_enabled},
+            },
+            "gdrive_upload": {
+                "default_folder_id_set": bool(self.gdrive_upload.default_folder_id),
             },
             "video_extensions": list(self.video_extensions),
             "logging": {
@@ -236,6 +243,7 @@ def load_config(
     bunny_raw = raw.get("bunny", {}) or {}
     download_raw = raw.get("download", {}) or {}
     targets_raw = raw.get("upload_targets", {}) or {}
+    gdrive_upload_raw = raw.get("gdrive_upload", {}) or {}
     logging_raw = raw.get("logging", {}) or {}
 
     app = AppSection(
@@ -305,6 +313,12 @@ def load_config(
         or "id",
     )
 
+    gdrive_upload = GDriveUploadSection(
+        default_folder_id=str(
+            gdrive_upload_raw.get("default_folder_id", "") or ""
+        ).strip(),
+    )
+
     log = LoggingSection(
         level=str(logging_raw.get("level", "INFO")).upper(),
         max_bytes=int(logging_raw.get("max_bytes", 5 * 1024 * 1024)),
@@ -342,6 +356,7 @@ def load_config(
         bunny=bunny,
         download=download,
         upload_targets=targets,
+        gdrive_upload=gdrive_upload,
         logging=log,
         video_extensions=video_extensions,
         secrets=secrets,
