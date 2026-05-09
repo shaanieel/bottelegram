@@ -41,6 +41,7 @@ from .bunny_uploader import BunnyUploader
 from .config_manager import AppConfig
 from .downloader import DownloadError, download, is_uploadable_video
 from .gdrive_api import GDriveAPIClient, GDriveAPIError
+from .gdrive_uploader import GDriveUploader
 from .logger import get_logger
 from .player4me_uploader import (
     Player4MeError,
@@ -63,6 +64,7 @@ from .subtitle_extractor import (
     detect_language_from_filename,
     extract_embedded_subtitles,
 )
+from .telegram_handlers_gdrive import register_gdrive_handlers, run_mirror_gdrive
 from .validators import (
     classify_link,
     is_url,
@@ -122,6 +124,7 @@ class BotApp:
         self.application = application
         self.bunny = BunnyUploader(cfg)
         self.player4me = Player4MeUploader(cfg)
+        self.gdrive_upload = GDriveUploader(cfg)
         self.queue = QueueManager(
             cfg,
             worker=self._run_job,
@@ -131,8 +134,9 @@ class BotApp:
         self._progress_msg: dict[str, tuple[int, int]] = {}
         self._last_render: dict[str, str] = {}
         self._last_progress_emit: dict[str, float] = {}
-        # Pending /m requests waiting for the user to pick an upload target.
-        # Mapping: pending_id -> (chat_id, user_id, title, url)
+        # Pending /m and /upload_player4me requests waiting for the user to
+        # pick a target / mode. Mapping: pending_id -> (chat_id, user_id,
+        # title, url).
         self._pending_mirror: dict[
             str, tuple[int, int, str, str]
         ] = {}
@@ -141,6 +145,7 @@ class BotApp:
         application.bot_data["queue"] = self.queue
         application.bot_data["bunny"] = self.bunny
         application.bot_data["player4me"] = self.player4me
+        application.bot_data["gdrive_upload"] = self.gdrive_upload
         application.bot_data["bot_app"] = self
 
         self._register_handlers()
@@ -186,6 +191,8 @@ class BotApp:
         app.add_handler(
             CallbackQueryHandler(self.cb_mirror_choice, pattern=r"^mirror:")
         )
+        # /gdrive_list + /mirror_gdrive (Telegram Index → Drive)
+        register_gdrive_handlers(app, self)
         # Fallback for unknown text from non-admins so we always reply gracefully
         app.add_handler(MessageHandler(filters.COMMAND, self.cmd_unknown))
 
@@ -207,17 +214,25 @@ class BotApp:
             ),
             BotCommand(
                 "upload_player4me",
-                "Download + upload ke Player4Me",
+                "Player4Me: pilih mode (video saja / sub embed / sub folder)",
             ),
             BotCommand(
                 "upload_player4me_subs",
-                "Player4Me + extract sub embed (mkv/mp4)",
+                "Player4Me + auto-extract sub embed (mkv/mp4)",
             ),
             BotCommand(
                 "upload_player4me_folder",
-                "Player4Me dari folder Drive + sub file",
+                "Player4Me dari folder Drive + sub file sidecar",
             ),
             BotCommand("download", "Download saja, tanpa upload"),
+            BotCommand(
+                "gdrive_list",
+                "Preview file di Telegram Index (filter keyword)",
+            ),
+            BotCommand(
+                "mirror_gdrive",
+                "Mirror Telegram Index → Google Drive (bulk)",
+            ),
             BotCommand("status", "Cek status video Bunny"),
             BotCommand("queue", "Lihat antrean job"),
             BotCommand("cancel", "Batalkan job (JOB_ID)"),
@@ -296,11 +311,13 @@ class BotApp:
             "/help — bantuan\n"
             "/m <i>URL</i> — mirror: download lalu pilih tombol upload (Bunny / Player4Me)\n"
             "/upload_bunny <i>[Judul |] URL</i> — download + upload ke Bunny Stream\n"
-            "/upload_player4me <i>[Judul |] URL</i> — download + upload ke Player4Me\n"
-            "/upload_player4me_subs <i>[Judul |] URL</i> — Player4Me + auto-extract sub embed di video (mkv/mp4)\n"
-            "/upload_player4me_folder <i>[Judul |] URL_FOLDER_DRIVE</i> — Player4Me dari folder Drive (video + file sub terpisah)\n"
+            "/upload_player4me <i>[Judul |] URL</i> — Player4Me: tampilkan tombol pilih mode upload (video saja / sub embed / sub folder)\n"
+            "/upload_player4me_subs <i>[Judul |] URL</i> — Player4Me + auto-extract sub embed di video (mkv/mp4) [skip picker]\n"
+            "/upload_player4me_folder <i>[Judul |] URL_FOLDER_DRIVE</i> — Player4Me dari folder Drive (video + file sub terpisah) [skip picker]\n"
             "/download <i>[Judul |] URL</i> — download saja (alias /download_only)\n"
             "/download_only <i>[Judul |] URL</i> — download saja\n"
+            "/gdrive_list <i>URL_INDEX [| keyword]</i> — preview file di Telegram Index, optional filter keyword (contoh: vmx)\n"
+            "/mirror_gdrive <i>URL_INDEX [| keyword] [| folder_id]</i> — bulk download dari Telegram Index lalu upload ke Google Drive\n"
             "/status <i>VIDEO_ID</i> — cek status video Bunny\n"
             "/queue — lihat antrean\n"
             "/cancel <i>JOB_ID</i> — batalkan job\n"
@@ -327,7 +344,12 @@ class BotApp:
     async def cmd_upload_player4me(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        await self._enqueue_from_command(update, context, JobType.UPLOAD_PLAYER4ME)
+        """``/upload_player4me URL`` — show a button picker so the user can
+        choose between *video saja*, *sub embed (auto-extract)*, atau *sub
+        file (folder Drive)*. Untuk skip picker, pakai
+        ``/upload_player4me_subs`` atau ``/upload_player4me_folder``.
+        """
+        await self._show_player4me_picker(update, context)
 
     @admin_only
     async def cmd_upload_player4me_subs(
@@ -466,6 +488,136 @@ class BotApp:
             if stem:
                 return stem
         return "Untitled"
+
+    async def _show_player4me_picker(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Tampilkan tombol pilihan mode Player4Me (video saja / embed / folder).
+
+        Logika sama seperti ``cmd_mirror`` tapi keyboard hanya berisi opsi
+        Player4Me. Dipakai oleh ``/upload_player4me URL`` supaya user selalu
+        diminta memilih 1 dari 3 mode (alih-alih langsung upload tanpa
+        ekstraksi subtitle).
+        """
+        msg = update.effective_message
+        if not msg:
+            return
+        raw = (msg.text or "").split(maxsplit=1)
+        args = raw[1].strip() if len(raw) > 1 else ""
+        if not args:
+            await msg.reply_text(
+                "Format: /upload_player4me [Judul |] URL\n"
+                "Contoh:\n"
+                "/upload_player4me https://drive.google.com/file/d/FILE_ID/view\n"
+                "/upload_player4me Judul Film | https://drive.google.com/drive/folders/FOLDER_ID"
+            )
+            return
+
+        title, url = parse_command_args(args)
+        if not url:
+            url = args.strip()
+            title = ""
+        if not is_url(url):
+            await msg.reply_text(
+                "URL tidak valid. Pastikan diawali http:// atau https://"
+            )
+            return
+
+        if not self.cfg.upload_targets.player4me_enabled:
+            await msg.reply_text(
+                "Upload Player4Me dinonaktifkan di config.yaml."
+            )
+            return
+        if not self.player4me.is_configured():
+            await msg.reply_text(
+                "Player4Me belum dikonfigurasi (PLAYER4ME_API_TOKEN kosong)."
+            )
+            return
+
+        title = (title or "").strip()
+        if not title:
+            title = await self._infer_title(url)
+
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        user = update.effective_user
+        user_id = user.id if user else 0
+
+        try:
+            info = classify_link(
+                url,
+                allow_google_drive=self.cfg.download.allow_google_drive,
+                allow_direct=self.cfg.download.allow_direct_link,
+                allow_ytdlp=self.cfg.download.allow_ytdlp,
+            )
+        except ValueError:
+            info = None
+        is_folder = bool(info and info.kind == "google_drive_folder")
+
+        pending_id = uuid.uuid4().hex[:8]
+        self._pending_mirror[pending_id] = (chat_id, user_id, title, url)
+
+        kind_hint = "FOLDER Drive" if is_folder else "file"
+        text = (
+            "<b>Upload Player4Me \u2014 pilih mode</b>\n"
+            f"Judul: {html.escape(title)}\n"
+            f"Tipe: {kind_hint}\n"
+            f"URL: <code>{html.escape(url)}</code>\n\n"
+            "Pilih salah satu mode di bawah ini:"
+        )
+        keyboard = self._player4me_keyboard(pending_id, is_folder=is_folder)
+        await msg.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
+    def _player4me_keyboard(
+        self, pending_id: str, *, is_folder: bool = False
+    ) -> InlineKeyboardMarkup:
+        """Keyboard untuk /upload_player4me — tampilkan 3 mode (atau hanya
+        mode folder kalau URL adalah folder Drive)."""
+        rows: list[list[InlineKeyboardButton]] = []
+        if is_folder:
+            # Folder URL → hanya mode "sub file (folder)" yang masuk akal.
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001F4C1 Player4Me + sub file (folder Drive)",
+                        callback_data=f"mirror:p4m_folder:{pending_id}",
+                    )
+                ]
+            )
+        else:
+            # File tunggal → tampilkan 2 pilihan utama subtitle (embed vs
+            # tanpa subtitle), plus 1 tombol untuk mode folder kalau user
+            # ternyata salah masukkan URL (yang akan gagal di runtime tapi
+            # paling tidak terlihat sebagai opsi).
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001F3AC Auto-extract sub embed (mkv/mp4)",
+                        callback_data=f"mirror:p4m_subs:{pending_id}",
+                    )
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\u25B6 Video saja (tanpa subtitle)",
+                        callback_data=f"mirror:player4me:{pending_id}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\u2715 Batal",
+                    callback_data=f"mirror:cancel:{pending_id}",
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
 
     def _mirror_keyboard(
         self, pending_id: str, *, is_folder: bool = False
@@ -1025,7 +1177,13 @@ class BotApp:
             )
             return
 
-        if not is_uploadable_video(result.path, self.cfg):
+        # MIRROR_GDRIVE menerima file apapun dari index — tidak hanya video.
+        # Skip pengecekan ekstensi video supaya .srt / .nfo / sample lain
+        # juga ikut ter-upload ke Drive.
+        if (
+            job.type != JobType.MIRROR_GDRIVE.value
+            and not is_uploadable_video(result.path, self.cfg)
+        ):
             raise RuntimeError(
                 f"File {result.path.name} bukan video yang valid "
                 f"(ekstensi tidak didukung)."
@@ -1042,6 +1200,10 @@ class BotApp:
         elif job.type == JobType.UPLOAD_PLAYER4ME_SUBS.value:
             await self._run_upload_player4me_with_embedded_subs(
                 job, result.path, progress, cancel_event
+            )
+        elif job.type == JobType.MIRROR_GDRIVE.value:
+            await run_mirror_gdrive(
+                self, job, result.path, progress, cancel_event
             )
         else:
             raise RuntimeError(f"Tipe job tidak dikenali: {job.type}")
@@ -1676,6 +1838,23 @@ class BotApp:
                 f"Embed URL:\n{job.embed_url or '-'}\n\n"
                 f"CDN Hostname:\n{self.cfg.bunny.cdn_hostname}\n\n"
                 "Catatan:\nVideo mungkin masih encoding beberapa menit."
+            )
+        elif job.type == JobType.MIRROR_GDRIVE.value:
+            keyword_hint = (
+                f"\nFilter keyword: <code>{html.escape(job.tgindex_keyword)}</code>"
+                if job.tgindex_keyword
+                else ""
+            )
+            link_line = (
+                f"\nLink: {job.gdrive_web_link}"
+                if job.gdrive_web_link
+                else ""
+            )
+            text = (
+                "<b>Mirror ke Google Drive Berhasil</b>\n\n"
+                f"Judul: {html.escape(job.title)}\n"
+                f"File ID: <code>{html.escape(job.gdrive_file_id or '-')}</code>"
+                f"{link_line}{keyword_hint}"
             )
         elif job.type in (
             JobType.UPLOAD_PLAYER4ME.value,

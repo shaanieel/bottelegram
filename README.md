@@ -470,11 +470,15 @@ bot Anda. Hanya `ADMIN_TELEGRAM_ID` yang dibalas.
 | --- | --- |
 | `/start` | Info bot dan panduan singkat. |
 | `/help` | Tampilkan semua command. |
-| `/m URL` | **Mirror**: download dari URL, lalu pilih tombol **Bunny Stream / Player4Me / Download saja**. Judul otomatis diambil dari nama file di sumber. |
+| `/m URL` | **Mirror**: download dari URL, lalu pilih tombol **Bunny Stream / Player4Me / Player4Me + sub embed / Player4Me + sub folder / Download saja**. Judul otomatis diambil dari nama file di sumber. |
 | `/upload_bunny [Judul \|] URL` | Download + upload ke Bunny Stream. Judul opsional. |
-| `/upload_player4me [Judul \|] URL` | Download + upload ke Player4Me (TUS). Judul opsional. |
+| `/upload_player4me [Judul \|] URL` | **Picker**: tampilkan tombol pilih mode upload Player4Me (video saja / sub embed / sub folder). |
+| `/upload_player4me_subs [Judul \|] URL` | Player4Me + auto-extract sub embed dari mkv/mp4 (lewati picker). |
+| `/upload_player4me_folder [Judul \|] URL_FOLDER_DRIVE` | Player4Me dari folder Drive + sub file sidecar (lewati picker). |
 | `/download [Judul \|] URL` | Download saja (alias `/download_only`). |
 | `/download_only [Judul \|] URL` | Download saja, tanpa upload. |
+| `/gdrive_list URL_INDEX [\| keyword]` | Preview daftar file di Telegram Index (HTML scraper), opsional filter keyword (contoh: `vmx`). Tidak download. |
+| `/mirror_gdrive URL_INDEX [\| keyword] [\| folder_id]` | Bulk download semua file dari Telegram Index lalu upload ke Google Drive. `folder_id` opsional (override `gdrive_upload.default_folder_id` di `config.yaml`). |
 | `/status VIDEO_ID` | Cek status video di Bunny. |
 | `/queue` | Lihat antrean job. |
 | `/cancel JOB_ID` | Batalkan job. |
