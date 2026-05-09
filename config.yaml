@@ -29,11 +29,6 @@ download:
   request_timeout_seconds: 60
   chunk_size_bytes: 1048576 # 1 MiB
   user_agent: "Mozilla/5.0 (compatible; ZAEINBot/1.0)"
-
-  # Engine order untuk link Google Drive:
-  #   1. GDriveAPI (kalau prefer_gdrive_api=true DAN API key/SA dikonfigurasi)
-  #   2. gdown
-  #   3. yt-dlp (fallback terakhir)
   prefer_gdrive_api: true
   gdrive_api_timeout_seconds: 30
   gdrive_api_chunk_size_bytes: 8388608  # 8 MiB
@@ -43,18 +38,18 @@ upload_targets:
     enabled: true
   player4me:
     enabled: true
-    # Kalau true dan URL terlihat publik (Drive uc?id=, dll), bot akan coba
-    # advance-upload (server player4me yang fetch) sebelum jatuh ke TUS lokal.
     prefer_url_ingest: true
-    # Optional Folder ID untuk auto-foldering di player4me. Kosongkan bila
-    # tidak butuh.
     default_folder_id: ""
-    # Default 2-char ISO 639-1 language code dipakai kalau ffprobe / nama
-    # file tidak menyebutkan bahasa subtitle (mis. "en", "ja"). Default
-    # "id" (Indonesia) sesuai kebutuhan utama bot.
     default_subtitle_language: "id"
   local_only:
     enabled: true
+
+# ----- Google Drive Upload (untuk fitur mirror_gdrive) -----
+gdrive_upload:
+  # Folder ID tujuan default di Google Drive.
+  # Ambil dari URL: drive.google.com/drive/folders/<FOLDER_ID_DI_SINI>
+  # Kosongkan ("") untuk upload ke root Drive.
+  default_folder_id: ""
 
 video_extensions:
   - ".mp4"
