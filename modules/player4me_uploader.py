@@ -331,8 +331,12 @@ class Player4MeUploader:
                     raise Player4MeError(
                         f"Player4Me /video/upload tidak mengembalikan tusUrl: {body!r}"
                     )
+                # Use the tusUrl exactly as the API returned it (incl. trailing
+                # slash). The TUS server's reverse proxy mounts POST on the URL
+                # with the trailing slash; stripping it caused HTTP 405 on the
+                # creation request.
                 return {
-                    "tusUrl": str(body["tusUrl"]).rstrip("/"),
+                    "tusUrl": str(body["tusUrl"]),
                     "accessToken": str(body["accessToken"]),
                 }
 
@@ -349,34 +353,56 @@ class Player4MeUploader:
             "Upload-Metadata": meta_header,
             "Content-Length": "0",
         }
+        log.debug("Player4Me TUS create POST -> %s (size=%s)", tus_url, total)
         async with aiohttp.ClientSession() as s:
-            async with s.post(
-                tus_url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                if resp.status not in (200, 201):
-                    body = await resp.text()
-                    raise Player4MeError(
-                        self._format_error("TUS create", resp.status, body)
+            try:
+                async with s.post(
+                    tus_url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        redirect = resp.headers.get("Location") or resp.headers.get(
+                            "location"
+                        )
+                        raise Player4MeError(
+                            f"Player4Me TUS create HTTP {resp.status} redirect ke "
+                            f"{redirect!r} dari {tus_url!r}. "
+                            "Cek tusUrl di response /api/v1/video/upload — "
+                            "trailing slash mungkin salah."
+                        )
+                    if resp.status not in (200, 201):
+                        body = await resp.text()
+                        raise Player4MeError(
+                            self._format_error(
+                                f"TUS create [{tus_url}]", resp.status, body
+                            )
+                        )
+                    location = resp.headers.get("Location") or resp.headers.get(
+                        "location"
                     )
-                location = resp.headers.get("Location") or resp.headers.get("location")
-                if not location:
-                    raise Player4MeError(
-                        "TUS create response tidak punya Location header"
-                    )
-                # Resolve relative Location against tus base
-                if location.startswith("/"):
-                    # https://host[:port]/<path> -> base host
-                    from urllib.parse import urlparse, urlunparse
+                    if not location:
+                        raise Player4MeError(
+                            "TUS create response tidak punya Location header"
+                        )
+                    # Resolve relative Location against tus base
+                    if location.startswith("/"):
+                        # https://host[:port]/<path> -> base host
+                        from urllib.parse import urlparse, urlunparse
 
-                    parsed = urlparse(tus_url)
-                    location = urlunparse(
-                        (parsed.scheme, parsed.netloc, location, "", "", "")
-                    )
-                elif not location.startswith(("http://", "https://")):
-                    location = f"{tus_url.rstrip('/')}/{location}"
-                return location
+                        parsed = urlparse(tus_url)
+                        location = urlunparse(
+                            (parsed.scheme, parsed.netloc, location, "", "", "")
+                        )
+                    elif not location.startswith(("http://", "https://")):
+                        location = f"{tus_url.rstrip('/')}/{location}"
+                    return location
+            except aiohttp.ClientError as exc:
+                raise Player4MeError(
+                    f"Player4Me TUS create network error ({tus_url}): "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
 
     async def _tus_patch_all(
         self,
