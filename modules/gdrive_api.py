@@ -137,10 +137,20 @@ class GDriveAPIClient:
                         _format_api_error("metadata", resp.status, body)
                     )
                 if resp.status == 404:
+                    if self.auth_mode() == "api_key":
+                        raise GDriveAPIError(
+                            "File tidak ditemukan (HTTP 404). "
+                            "API Key Google hanya bisa membaca file PUBLIC "
+                            "('Anyone with the link'). Untuk file private "
+                            "Anda WAJIB pakai Service Account: isi "
+                            "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON di .env, lalu "
+                            "share file ini ke email service account-nya. "
+                            "Atau ubah file ke 'Anyone with the link' di Drive."
+                        )
                     raise GDriveAPIError(
-                        "File tidak ditemukan / tidak diizinkan untuk akun ini "
-                        "(404). Untuk file private, share dulu ke email service "
-                        "account."
+                        "File tidak ditemukan / tidak diizinkan untuk service "
+                        "account ini (HTTP 404). Share file ke email service "
+                        "account dengan akses minimum Viewer."
                     )
                 if resp.status >= 400:
                     raise GDriveAPIError(
