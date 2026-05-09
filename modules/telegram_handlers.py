@@ -40,9 +40,13 @@ from telegram.ext import (
 from .bunny_uploader import BunnyUploader
 from .config_manager import AppConfig
 from .downloader import DownloadError, download, is_uploadable_video
-from .gdrive_api import GDriveAPIClient
+from .gdrive_api import GDriveAPIClient, GDriveAPIError
 from .logger import get_logger
-from .player4me_uploader import Player4MeError, Player4MeUploader
+from .player4me_uploader import (
+    Player4MeError,
+    Player4MeUploader,
+    Player4MeUploadResult,
+)
 from .queue_manager import Job, JobStatus, JobType, QueueManager
 from .storage_manager import (
     clear_directory,
@@ -53,9 +57,16 @@ from .storage_manager import (
     list_files,
     safe_unlink,
 )
+from .subtitle_extractor import (
+    ExtractedSubtitle,
+    SubtitleExtractError,
+    detect_language_from_filename,
+    extract_embedded_subtitles,
+)
 from .validators import (
     classify_link,
     is_url,
+    is_video_extension,
     parse_command_args,
     safe_filename,
 )
@@ -147,6 +158,16 @@ class BotApp:
         app.add_handler(
             CommandHandler("upload_player4me", self.cmd_upload_player4me)
         )
+        app.add_handler(
+            CommandHandler(
+                "upload_player4me_subs", self.cmd_upload_player4me_subs
+            )
+        )
+        app.add_handler(
+            CommandHandler(
+                "upload_player4me_folder", self.cmd_upload_player4me_folder
+            )
+        )
         app.add_handler(CommandHandler("download_only", self.cmd_download_only))
         app.add_handler(CommandHandler("download", self.cmd_download_only))
         app.add_handler(CommandHandler("status", self.cmd_status))
@@ -187,6 +208,14 @@ class BotApp:
             BotCommand(
                 "upload_player4me",
                 "Download + upload ke Player4Me",
+            ),
+            BotCommand(
+                "upload_player4me_subs",
+                "Player4Me + extract sub embed (mkv/mp4)",
+            ),
+            BotCommand(
+                "upload_player4me_folder",
+                "Player4Me dari folder Drive + sub file",
             ),
             BotCommand("download", "Download saja, tanpa upload"),
             BotCommand("status", "Cek status video Bunny"),
@@ -268,6 +297,8 @@ class BotApp:
             "/m <i>URL</i> — mirror: download lalu pilih tombol upload (Bunny / Player4Me)\n"
             "/upload_bunny <i>[Judul |] URL</i> — download + upload ke Bunny Stream\n"
             "/upload_player4me <i>[Judul |] URL</i> — download + upload ke Player4Me\n"
+            "/upload_player4me_subs <i>[Judul |] URL</i> — Player4Me + auto-extract sub embed di video (mkv/mp4)\n"
+            "/upload_player4me_folder <i>[Judul |] URL_FOLDER_DRIVE</i> — Player4Me dari folder Drive (video + file sub terpisah)\n"
             "/download <i>[Judul |] URL</i> — download saja (alias /download_only)\n"
             "/download_only <i>[Judul |] URL</i> — download saja\n"
             "/status <i>VIDEO_ID</i> — cek status video Bunny\n"
@@ -297,6 +328,22 @@ class BotApp:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         await self._enqueue_from_command(update, context, JobType.UPLOAD_PLAYER4ME)
+
+    @admin_only
+    async def cmd_upload_player4me_subs(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._enqueue_from_command(
+            update, context, JobType.UPLOAD_PLAYER4ME_SUBS
+        )
+
+    @admin_only
+    async def cmd_upload_player4me_folder(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._enqueue_from_command(
+            update, context, JobType.UPLOAD_PLAYER4ME_FOLDER
+        )
 
     @admin_only
     async def cmd_download_only(
@@ -340,17 +387,31 @@ class BotApp:
         user = update.effective_user
         user_id = user.id if user else 0
 
+        # Detect Drive folder URL so we render the right tombol set.
+        try:
+            info = classify_link(
+                url,
+                allow_google_drive=self.cfg.download.allow_google_drive,
+                allow_direct=self.cfg.download.allow_direct_link,
+                allow_ytdlp=self.cfg.download.allow_ytdlp,
+            )
+        except ValueError:
+            info = None
+        is_folder = bool(info and info.kind == "google_drive_folder")
+
         # 8 hex chars is plenty for callback uniqueness within this process.
         pending_id = uuid.uuid4().hex[:8]
         self._pending_mirror[pending_id] = (chat_id, user_id, title, url)
 
+        kind_hint = "FOLDER Drive" if is_folder else "file"
         text = (
             "<b>Tugas baru — pilih target upload</b>\n"
             f"Judul: {html.escape(title)}\n"
+            f"Tipe: {kind_hint}\n"
             f"URL: <code>{html.escape(url)}</code>\n\n"
             "Klik tombol di bawah untuk memilih kemana file di-upload."
         )
-        keyboard = self._mirror_keyboard(pending_id)
+        keyboard = self._mirror_keyboard(pending_id, is_folder=is_folder)
         await msg.reply_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -382,6 +443,19 @@ class BotApp:
                 except Exception as exc:
                     log.debug("infer_title gagal ambil meta Drive: %s", exc)
 
+        if info.kind == "google_drive_folder" and info.folder_id:
+            client = GDriveAPIClient(self.cfg)
+            if client.is_configured() and (
+                client.has_oauth_token() or client.has_service_account()
+            ):
+                try:
+                    meta = await client.get_metadata(info.folder_id)
+                    name = str(meta.get("name") or "").strip()
+                    if name:
+                        return safe_filename(name)
+                except Exception as exc:
+                    log.debug("infer_title gagal ambil meta folder Drive: %s", exc)
+
         # Fallback: filename portion of the URL path.
         from urllib.parse import unquote, urlparse
 
@@ -393,23 +467,50 @@ class BotApp:
                 return stem
         return "Untitled"
 
-    def _mirror_keyboard(self, pending_id: str) -> InlineKeyboardMarkup:
+    def _mirror_keyboard(
+        self, pending_id: str, *, is_folder: bool = False
+    ) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
-        first_row: list[InlineKeyboardButton] = []
-        if (
+        p4m_ok = (
+            self.cfg.upload_targets.player4me_enabled
+            and self.player4me.is_configured()
+        )
+        bunny_ok = (
             self.cfg.upload_targets.bunny_stream_enabled
             and self.bunny.is_configured()
-        ):
+        )
+        if is_folder:
+            # A folder URL only makes sense for the "Player4Me + sub file"
+            # variant (sidecar subtitles next to the video file). Bunny / TUS
+            # plain don't accept a folder.
+            if p4m_ok:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            "\u25B6 Player4Me + sub file (folder)",
+                            callback_data=f"mirror:p4m_folder:{pending_id}",
+                        )
+                    ]
+                )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\u2715 Batal",
+                        callback_data=f"mirror:cancel:{pending_id}",
+                    )
+                ]
+            )
+            return InlineKeyboardMarkup(rows)
+
+        first_row: list[InlineKeyboardButton] = []
+        if bunny_ok:
             first_row.append(
                 InlineKeyboardButton(
                     "\u25B6 Bunny Stream",
                     callback_data=f"mirror:bunny:{pending_id}",
                 )
             )
-        if (
-            self.cfg.upload_targets.player4me_enabled
-            and self.player4me.is_configured()
-        ):
+        if p4m_ok:
             first_row.append(
                 InlineKeyboardButton(
                     "\u25B6 Player4Me",
@@ -418,6 +519,15 @@ class BotApp:
             )
         if first_row:
             rows.append(first_row)
+        if p4m_ok:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\u25B6 Player4Me + sub embed (mkv)",
+                        callback_data=f"mirror:p4m_subs:{pending_id}",
+                    )
+                ]
+            )
         rows.append(
             [
                 InlineKeyboardButton(
@@ -488,6 +598,22 @@ class BotApp:
         elif action == "player4me":
             job_type = JobType.UPLOAD_PLAYER4ME
             target_label = "Player4Me"
+            if not self.player4me.is_configured():
+                await query.answer(
+                    "Player4Me belum dikonfigurasi.", show_alert=True
+                )
+                return
+        elif action == "p4m_subs":
+            job_type = JobType.UPLOAD_PLAYER4ME_SUBS
+            target_label = "Player4Me + sub embed"
+            if not self.player4me.is_configured():
+                await query.answer(
+                    "Player4Me belum dikonfigurasi.", show_alert=True
+                )
+                return
+        elif action == "p4m_folder":
+            job_type = JobType.UPLOAD_PLAYER4ME_FOLDER
+            target_label = "Player4Me + sub file (folder)"
             if not self.player4me.is_configured():
                 await query.answer(
                     "Player4Me belum dikonfigurasi.", show_alert=True
@@ -568,22 +694,41 @@ class BotApp:
             )
             return
 
-        if (
-            job_type == JobType.UPLOAD_PLAYER4ME
-            and not self.cfg.upload_targets.player4me_enabled
-        ):
+        p4m_jobs = {
+            JobType.UPLOAD_PLAYER4ME,
+            JobType.UPLOAD_PLAYER4ME_SUBS,
+            JobType.UPLOAD_PLAYER4ME_FOLDER,
+        }
+        if job_type in p4m_jobs and not self.cfg.upload_targets.player4me_enabled:
             await msg.reply_text(
                 "Upload Player4Me dinonaktifkan di config.yaml."
             )
             return
-        if (
-            job_type == JobType.UPLOAD_PLAYER4ME
-            and not self.player4me.is_configured()
-        ):
+        if job_type in p4m_jobs and not self.player4me.is_configured():
             await msg.reply_text(
                 "Player4Me belum dikonfigurasi (PLAYER4ME_API_TOKEN kosong)."
             )
             return
+
+        # The folder flow only accepts a Drive folder URL because we need to
+        # enumerate the contents via the Drive API; reject anything else early
+        # rather than silently downloading a single file.
+        if job_type == JobType.UPLOAD_PLAYER4ME_FOLDER:
+            try:
+                info = classify_link(
+                    url,
+                    allow_google_drive=self.cfg.download.allow_google_drive,
+                    allow_direct=self.cfg.download.allow_direct_link,
+                    allow_ytdlp=self.cfg.download.allow_ytdlp,
+                )
+            except ValueError:
+                info = None
+            if not info or info.kind != "google_drive_folder":
+                await msg.reply_text(
+                    "Untuk /upload_player4me_folder, URL harus link folder "
+                    "Google Drive (drive.google.com/drive/folders/...)."
+                )
+                return
 
         title = (title or "").strip()
         if not title:
@@ -839,7 +984,16 @@ class BotApp:
         cancel_event: asyncio.Event,
         progress: Callable[[str, float | None, str], Awaitable[None]],
     ) -> None:
-        # 1) Download
+        # The folder flow doesn't go through the standard ``download()`` path
+        # (which expects a single file URL); it has its own download+upload
+        # pipeline that pulls every file in the Drive folder one-by-one.
+        if job.type == JobType.UPLOAD_PLAYER4ME_FOLDER.value:
+            await self._run_upload_player4me_folder(
+                job, progress, cancel_event
+            )
+            return
+
+        # 1) Download (single file)
         try:
             result = await download(
                 job.source_url,
@@ -883,6 +1037,10 @@ class BotApp:
             )
         elif job.type == JobType.UPLOAD_PLAYER4ME.value:
             await self._run_upload_player4me(
+                job, result.path, progress, cancel_event
+            )
+        elif job.type == JobType.UPLOAD_PLAYER4ME_SUBS.value:
+            await self._run_upload_player4me_with_embedded_subs(
                 job, result.path, progress, cancel_event
             )
         else:
@@ -958,6 +1116,502 @@ class BotApp:
             ),
         )
 
+    # ---- player4me + embedded subtitle extraction (Flow A) ------------- #
+
+    async def _run_upload_player4me_with_embedded_subs(
+        self,
+        job: Job,
+        file_path: Path,
+        progress: Callable[[str, float | None, str], Awaitable[None]],
+        cancel_event: asyncio.Event,
+    ) -> None:
+        """Flow A: extract subs from a single mkv/mp4, upload video + subs.
+
+        The video file has already been downloaded into ``file_path`` by the
+        common download stage. We:
+          1. Snapshot existing video IDs on Player4Me (used to identify the
+             new video after TUS upload, which doesn't return videoId).
+          2. Probe the file for embedded subtitle streams and extract every
+             text-based one (subrip / ass / vtt / mov_text) to a temp dir.
+          3. TUS-upload the video.
+          4. List ``/video/manage`` and pick the new entry by name (or by
+             diff against the snapshot). That gives us the videoId.
+          5. PUT each extracted subtitle to ``/video/{id}/subtitle``.
+          6. Clean up the per-job temp dir.
+        """
+        default_lang = (
+            self.cfg.upload_targets.player4me_default_subtitle_language
+        )
+        folder_id = (
+            self.cfg.upload_targets.player4me_default_folder_id or None
+        )
+
+        await progress(
+            "uploading", 0.0, "Snapshot daftar video Player4Me sebelum upload\u2026"
+        )
+        try:
+            existing_ids = await self.player4me.snapshot_video_ids(
+                folder_id=folder_id
+            )
+        except Player4MeError as exc:
+            log.warning("snapshot video gagal (%s) \u2014 lanjut tanpa snapshot", exc)
+            existing_ids = set()
+
+        sub_dir = self.cfg.paths.temp_dir / f"subs-{job.job_id}"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        extracted: list[ExtractedSubtitle] = []
+        try:
+            await progress(
+                "uploading",
+                0.0,
+                f"Probe subtitle embed di {file_path.name}\u2026",
+            )
+            try:
+                extracted = await extract_embedded_subtitles(
+                    file_path,
+                    sub_dir,
+                    default_language=default_lang,
+                    base_name=Path(safe_filename(job.title)).stem or job.title,
+                )
+            except SubtitleExtractError as exc:
+                # ``ffmpeg`` missing or container probe failed \u2014 don't fail
+                # the whole upload, just continue without subs.
+                log.warning(
+                    "Extract subtitle gagal untuk %s: %s", file_path, exc
+                )
+                extracted = []
+
+            if extracted:
+                summary = ", ".join(
+                    f"{s.language}({s.codec})" for s in extracted
+                )
+                await progress(
+                    "uploading",
+                    0.0,
+                    f"Subtitle ditemukan ({len(extracted)}): {summary}",
+                )
+            else:
+                await progress(
+                    "uploading",
+                    0.0,
+                    "Tidak ada subtitle text yang bisa di-extract \u2014 lanjut upload video saja.",
+                )
+
+            # 3) Upload video via TUS.
+            try:
+                upload_res: Player4MeUploadResult = (
+                    await self.player4me.upload_local_file(
+                        file_path,
+                        title=job.title,
+                        folder_id=folder_id,
+                        progress_cb=progress,
+                        cancel_event=cancel_event,
+                    )
+                )
+            except Player4MeError as exc:
+                raise RuntimeError(
+                    f"Upload Player4Me (TUS) gagal: {exc}"
+                ) from exc
+
+            video_id = upload_res.primary_video_id
+            # If TUS didn't surface a videoId, recover by listing recent uploads.
+            if not video_id and extracted:
+                await progress(
+                    "uploading",
+                    None,
+                    "Mencari video_id baru di Player4Me\u2026",
+                )
+                try:
+                    found = await self.player4me.find_recent_video_by_name(
+                        file_path.name,
+                        folder_id=folder_id,
+                        existing_ids=existing_ids,
+                    )
+                except Player4MeError as exc:
+                    log.warning("find_recent_video gagal: %s", exc)
+                    found = None
+                if found and found.get("id"):
+                    video_id = str(found.get("id"))
+                    upload_res.video_ids.insert(0, video_id)
+
+            # 4) Upload extracted subtitles (best-effort \u2014 one failure
+            # doesn't poison the others, but we collect a summary).
+            uploaded_subs: list[str] = []
+            failed_subs: list[str] = []
+            if extracted and not video_id:
+                log.warning(
+                    "Tidak dapat menentukan video_id Player4Me \u2014 "
+                    "subtitle tidak di-upload (video sudah masuk)."
+                )
+                failed_subs = [
+                    f"{s.language}: video_id tidak ditemukan"
+                    for s in extracted
+                ]
+            elif video_id and extracted:
+                for idx, sub in enumerate(extracted, start=1):
+                    if cancel_event.is_set():
+                        break
+                    await progress(
+                        "uploading",
+                        None,
+                        (
+                            f"Upload subtitle {idx}/{len(extracted)} "
+                            f"({sub.language})\u2026"
+                        ),
+                    )
+                    try:
+                        await self.player4me.upload_subtitle(
+                            video_id,
+                            sub.path,
+                            language=sub.language,
+                            name=sub.name,
+                        )
+                        uploaded_subs.append(sub.language)
+                    except Player4MeError as exc:
+                        log.warning(
+                            "Upload subtitle %s gagal: %s", sub.path, exc
+                        )
+                        failed_subs.append(f"{sub.language}: {exc}")
+
+            sub_summary = self._format_sub_summary(
+                uploaded_subs, failed_subs, extracted
+            )
+            await self.queue._update(  # type: ignore[attr-defined]
+                job,
+                player4me_task_id=upload_res.task_id,
+                player4me_video_id=video_id or upload_res.primary_video_id,
+                player4me_status=upload_res.status,
+                player4me_engine=upload_res.engine,
+                status=JobStatus.COMPLETED,
+                finished_at=time.time(),
+                progress=100.0,
+                progress_text=(
+                    f"Upload selesai. Player4Me ({upload_res.engine}): "
+                    f"{upload_res.status}. {sub_summary}"
+                ),
+            )
+        finally:
+            # Clean up the per-job subtitle temp dir whether we succeeded or not.
+            try:
+                shutil.rmtree(sub_dir, ignore_errors=True)
+            except Exception as exc:
+                log.debug("Cleanup sub_dir %s gagal: %s", sub_dir, exc)
+
+    # ---- player4me + Drive folder + sidecar subs (Flow B) ------------- #
+
+    async def _run_upload_player4me_folder(
+        self,
+        job: Job,
+        progress: Callable[[str, float | None, str], Awaitable[None]],
+        cancel_event: asyncio.Event,
+    ) -> None:
+        """Flow B: Drive folder URL \u2192 download files individually \u2192 upload.
+
+        We:
+          1. Resolve folder_id from ``job.source_url``.
+          2. List the folder via Drive API (OAuth/SA).
+          3. Pick the largest video file as the "main" video and treat every
+             text subtitle file (.srt / .ass / .vtt) as a sidecar.
+          4. Download each file individually into ``downloads/<job_id>/``.
+          5. Snapshot Player4Me, TUS-upload the video, recover videoId.
+          6. Upload each subtitle.
+          7. Clean up the per-job download folder.
+        """
+        try:
+            info = classify_link(
+                job.source_url,
+                allow_google_drive=self.cfg.download.allow_google_drive,
+                allow_direct=self.cfg.download.allow_direct_link,
+                allow_ytdlp=self.cfg.download.allow_ytdlp,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"URL tidak valid untuk folder Drive: {exc}"
+            ) from exc
+        if info.kind != "google_drive_folder" or not info.folder_id:
+            raise RuntimeError(
+                "URL bukan folder Google Drive (drive.google.com/drive/folders/...)."
+            )
+
+        client = GDriveAPIClient(self.cfg)
+        if not (client.has_oauth_token() or client.has_service_account()):
+            raise RuntimeError(
+                "Listing folder Drive butuh OAuth user-token atau "
+                "Service Account. Set GOOGLE_DRIVE_OAUTH_TOKEN_PATH atau "
+                "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON di .env."
+            )
+
+        await progress("starting", 0.0, "Listing folder Drive\u2026")
+        try:
+            entries = await client.list_folder(info.folder_id)
+        except GDriveAPIError as exc:
+            raise RuntimeError(f"List folder Drive gagal: {exc}") from exc
+        if not entries:
+            raise RuntimeError(
+                "Folder Drive kosong (atau service account tidak punya akses)."
+            )
+
+        # Filter out subfolders / Google Docs natives \u2014 we only handle
+        # binary files (videos + sidecar subtitles). The list is small enough
+        # that an O(n) scan is fine.
+        videos: list[dict] = []
+        subs: list[dict] = []
+        skipped: list[str] = []
+        for e in entries:
+            mime = str(e.get("mimeType") or "")
+            name = str(e.get("name") or "").strip()
+            if not name:
+                continue
+            if mime == "application/vnd.google-apps.folder":
+                skipped.append(f"{name} (subfolder)")
+                continue
+            if mime.startswith("application/vnd.google-apps."):
+                skipped.append(f"{name} (gdoc native)")
+                continue
+            ext = Path(name).suffix.lower()
+            if (
+                is_video_extension(name, self.cfg.video_extensions)
+                or mime.startswith("video/")
+            ):
+                videos.append(e)
+            elif ext in {".srt", ".ass", ".ssa", ".vtt"}:
+                subs.append(e)
+            else:
+                skipped.append(f"{name} ({mime or 'unknown'})")
+
+        if not videos:
+            raise RuntimeError(
+                "Folder tidak punya file video (.mp4/.mkv/...). Isi: "
+                + ", ".join(e.get("name", "?") for e in entries[:5])
+            )
+
+        # Largest video by size = main video. ``size`` is a string in Drive's
+        # JSON (it can exceed 2\u00b3\u00b2 bytes), so int() is the safe cast.
+        def _size_int(d: dict) -> int:
+            try:
+                return int(d.get("size") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        videos.sort(key=_size_int, reverse=True)
+        main_video = videos[0]
+        # Any extra videos we'll skip with a warning to keep the flow simple.
+        for extra in videos[1:]:
+            skipped.append(f"{extra.get('name')} (video tambahan, di-skip)")
+
+        await progress(
+            "downloading",
+            0.0,
+            (
+                f"Folder berisi: 1 video utama, {len(subs)} subtitle, "
+                f"{len(skipped)} di-skip"
+            ),
+        )
+
+        # Per-job download dir keeps things tidy on cleanup. We use the
+        # configured downloads_dir as the parent so cap-on-disk monitoring
+        # still applies.
+        job_dir = self.cfg.paths.download_dir / f"folder-{job.job_id}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Download main video.
+            video_name = safe_filename(str(main_video.get("name") or "video.mp4"))
+            video_path = job_dir / video_name
+            await progress(
+                "downloading",
+                0.0,
+                f"Download video utama \u2014 {video_name}\u2026",
+            )
+            await client.download(
+                str(main_video["id"]),
+                video_path,
+                progress_cb=progress,
+                cancel_event=cancel_event,
+            )
+            video_size = video_path.stat().st_size if video_path.exists() else 0
+            await self.queue._update(  # type: ignore[attr-defined]
+                job,
+                file_path=str(video_path),
+                file_size_bytes=video_size,
+                status=JobStatus.DOWNLOADED,
+                progress=100.0,
+                progress_text=(
+                    f"Video utama download selesai ({human_bytes(video_size)})"
+                ),
+            )
+            if not is_uploadable_video(video_path, self.cfg):
+                raise RuntimeError(
+                    f"File {video_path.name} bukan video yang valid "
+                    f"(ekstensi tidak didukung)."
+                )
+
+            # Download every subtitle file individually.
+            sub_paths: list[tuple[Path, dict]] = []
+            default_lang = (
+                self.cfg.upload_targets.player4me_default_subtitle_language
+            )
+            for idx, sub in enumerate(subs, start=1):
+                if cancel_event.is_set():
+                    break
+                sub_name = safe_filename(str(sub.get("name") or f"sub-{idx}.srt"))
+                sub_path = job_dir / sub_name
+                await progress(
+                    "downloading",
+                    None,
+                    f"Download subtitle {idx}/{len(subs)} \u2014 {sub_name}\u2026",
+                )
+                try:
+                    await client.download(
+                        str(sub["id"]),
+                        sub_path,
+                        progress_cb=None,
+                        cancel_event=cancel_event,
+                    )
+                    sub_paths.append((sub_path, sub))
+                except GDriveAPIError as exc:
+                    log.warning(
+                        "Download subtitle %s gagal: %s", sub_name, exc
+                    )
+
+            # Snapshot, upload video via TUS, recover videoId, attach subs.
+            folder_id = (
+                self.cfg.upload_targets.player4me_default_folder_id or None
+            )
+            await progress(
+                "uploading",
+                0.0,
+                "Snapshot daftar video Player4Me sebelum upload\u2026",
+            )
+            try:
+                existing_ids = await self.player4me.snapshot_video_ids(
+                    folder_id=folder_id
+                )
+            except Player4MeError as exc:
+                log.warning(
+                    "snapshot video gagal (%s) \u2014 lanjut tanpa snapshot", exc
+                )
+                existing_ids = set()
+
+            try:
+                upload_res = await self.player4me.upload_local_file(
+                    video_path,
+                    title=job.title,
+                    folder_id=folder_id,
+                    progress_cb=progress,
+                    cancel_event=cancel_event,
+                )
+            except Player4MeError as exc:
+                raise RuntimeError(
+                    f"Upload Player4Me (TUS) gagal: {exc}"
+                ) from exc
+
+            video_id = upload_res.primary_video_id
+            if not video_id and sub_paths:
+                await progress(
+                    "uploading",
+                    None,
+                    "Mencari video_id baru di Player4Me\u2026",
+                )
+                try:
+                    found = await self.player4me.find_recent_video_by_name(
+                        video_path.name,
+                        folder_id=folder_id,
+                        existing_ids=existing_ids,
+                    )
+                except Player4MeError as exc:
+                    log.warning("find_recent_video gagal: %s", exc)
+                    found = None
+                if found and found.get("id"):
+                    video_id = str(found.get("id"))
+                    upload_res.video_ids.insert(0, video_id)
+
+            uploaded_subs: list[str] = []
+            failed_subs: list[str] = []
+            if sub_paths and not video_id:
+                log.warning(
+                    "Tidak dapat menentukan video_id Player4Me \u2014 "
+                    "subtitle tidak di-upload (video sudah masuk)."
+                )
+                failed_subs = [
+                    f"{p.name}: video_id tidak ditemukan"
+                    for p, _ in sub_paths
+                ]
+            elif video_id and sub_paths:
+                for idx, (sub_path, sub_meta) in enumerate(
+                    sub_paths, start=1
+                ):
+                    if cancel_event.is_set():
+                        break
+                    lang, label = detect_language_from_filename(
+                        sub_path.name, default=default_lang
+                    )
+                    await progress(
+                        "uploading",
+                        None,
+                        (
+                            f"Upload subtitle {idx}/{len(sub_paths)} "
+                            f"({lang}) \u2014 {sub_path.name}\u2026"
+                        ),
+                    )
+                    try:
+                        await self.player4me.upload_subtitle(
+                            video_id,
+                            sub_path,
+                            language=lang,
+                            name=label,
+                        )
+                        uploaded_subs.append(lang)
+                    except Player4MeError as exc:
+                        log.warning(
+                            "Upload subtitle %s gagal: %s", sub_path, exc
+                        )
+                        failed_subs.append(f"{sub_path.name}: {exc}")
+
+            sub_summary = self._format_sub_summary(
+                uploaded_subs, failed_subs, sub_paths
+            )
+            await self.queue._update(  # type: ignore[attr-defined]
+                job,
+                player4me_task_id=upload_res.task_id,
+                player4me_video_id=video_id or upload_res.primary_video_id,
+                player4me_status=upload_res.status,
+                player4me_engine=upload_res.engine,
+                status=JobStatus.COMPLETED,
+                finished_at=time.time(),
+                progress=100.0,
+                progress_text=(
+                    f"Upload selesai. Player4Me ({upload_res.engine}): "
+                    f"{upload_res.status}. {sub_summary}"
+                ),
+            )
+        finally:
+            if self.cfg.app.auto_delete_after_upload:
+                try:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    log.info("Auto-deleted folder %s", job_dir)
+                except Exception as exc:
+                    log.debug("Cleanup folder %s gagal: %s", job_dir, exc)
+
+    @staticmethod
+    def _format_sub_summary(
+        uploaded: list[str],
+        failed: list[str],
+        attempted,
+    ) -> str:
+        """Build a one-line subtitle outcome summary for progress messages."""
+        n_attempted = len(attempted) if hasattr(attempted, "__len__") else 0
+        if not n_attempted:
+            return "Tanpa subtitle."
+        if uploaded and not failed:
+            return f"Subtitle: {len(uploaded)}/{n_attempted} OK ({', '.join(uploaded)})."
+        if uploaded and failed:
+            return (
+                f"Subtitle: {len(uploaded)}/{n_attempted} OK "
+                f"({', '.join(uploaded)}); {len(failed)} gagal."
+            )
+        return f"Subtitle: 0/{n_attempted} OK \u2014 semua gagal."
+
     # ---- live progress notifications ------------------------------------ #
 
     async def _on_job_status_change(self, job: Job) -> None:
@@ -1023,18 +1677,29 @@ class BotApp:
                 f"CDN Hostname:\n{self.cfg.bunny.cdn_hostname}\n\n"
                 "Catatan:\nVideo mungkin masih encoding beberapa menit."
             )
-        elif job.type == JobType.UPLOAD_PLAYER4ME.value:
+        elif job.type in (
+            JobType.UPLOAD_PLAYER4ME.value,
+            JobType.UPLOAD_PLAYER4ME_SUBS.value,
+            JobType.UPLOAD_PLAYER4ME_FOLDER.value,
+        ):
             engine_label = {
                 "advance_upload": "URL ingest (server-side)",
                 "tus": "TUS upload (lokal)",
             }.get(job.player4me_engine or "", job.player4me_engine or "-")
+            mode_label = {
+                JobType.UPLOAD_PLAYER4ME.value: "video saja",
+                JobType.UPLOAD_PLAYER4ME_SUBS.value: "video + sub embed (extracted)",
+                JobType.UPLOAD_PLAYER4ME_FOLDER.value: "video + sub file (folder Drive)",
+            }.get(job.type, job.type)
             text = (
                 "<b>Upload Player4Me Berhasil</b>\n\n"
+                f"Mode:\n{html.escape(mode_label)}\n\n"
                 f"Judul:\n{html.escape(job.title)}\n\n"
                 f"Engine:\n{html.escape(engine_label)}\n\n"
                 f"Status:\n{html.escape(job.player4me_status or '-')}\n\n"
                 f"Task ID:\n<code>{html.escape(job.player4me_task_id or '-')}</code>\n\n"
                 f"Video ID:\n<code>{html.escape(job.player4me_video_id or '-')}</code>\n\n"
+                f"Detail:\n{html.escape(job.progress_text or '-')}\n\n"
                 "Catatan:\nVideo mungkin masih encoding beberapa menit "
                 "di player4me."
             )

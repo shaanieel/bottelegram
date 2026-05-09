@@ -78,6 +78,9 @@ class UploadTargetsSection:
     local_only_enabled: bool = True
     player4me_prefer_url_ingest: bool = True
     player4me_default_folder_id: str = ""
+    # 2-char ISO 639-1 fallback when ffprobe/filename heuristics can't
+    # determine a subtitle's language. Default is Indonesian.
+    player4me_default_subtitle_language: str = "id"
 
 
 @dataclass
@@ -163,6 +166,9 @@ class AppConfig:
                     "prefer_url_ingest": self.upload_targets.player4me_prefer_url_ingest,
                     "default_folder_id_set": bool(
                         self.upload_targets.player4me_default_folder_id
+                    ),
+                    "default_subtitle_language": (
+                        self.upload_targets.player4me_default_subtitle_language
                     ),
                 },
                 "local_only": {"enabled": self.upload_targets.local_only_enabled},
@@ -293,6 +299,10 @@ def load_config(
         player4me_default_folder_id=str(
             p4m_raw.get("default_folder_id", "") or ""
         ).strip(),
+        player4me_default_subtitle_language=str(
+            p4m_raw.get("default_subtitle_language", "id") or "id"
+        ).strip().lower()[:2]
+        or "id",
     )
 
     log = LoggingSection(

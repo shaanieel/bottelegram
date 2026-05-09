@@ -183,6 +183,68 @@ class GDriveAPIClient:
 
     # ----- public API ------------------------------------------------------ #
 
+    async def list_folder(
+        self, folder_id: str, *, page_size: int = 200
+    ) -> list[dict[str, Any]]:
+        """List immediate children of a Drive folder.
+
+        Walks ``files.list`` pages until exhausted and returns the merged list
+        of ``{id,name,mimeType,size,...}`` entries. Requires OAuth or Service
+        Account auth — bare API key cannot list private folders.
+        """
+        if not (self.has_oauth_token() or self.has_service_account()):
+            raise GDriveAPIError(
+                "List folder Google Drive butuh OAuth user token atau "
+                "Service Account. API key saja tidak cukup. "
+                "Set GOOGLE_DRIVE_OAUTH_TOKEN_PATH atau "
+                "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON di .env."
+            )
+        url = f"{DRIVE_API_BASE}/files"
+        headers = await self._auth_headers()
+        timeout = aiohttp.ClientTimeout(
+            total=self.cfg.download.gdrive_api_timeout_seconds * 2
+        )
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                params = self._params(
+                    {
+                        "q": (
+                            f"'{folder_id}' in parents and trashed=false"
+                        ),
+                        "fields": (
+                            "nextPageToken,files(id,name,size,mimeType,"
+                            "md5Checksum,modifiedTime)"
+                        ),
+                        "pageSize": str(page_size),
+                        "supportsAllDrives": "true",
+                        "includeItemsFromAllDrives": "true",
+                        "orderBy": "name",
+                    }
+                )
+                if page_token:
+                    params["pageToken"] = page_token
+                async with session.get(
+                    url, params=params, headers=headers
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status >= 400:
+                        raise GDriveAPIError(
+                            _format_api_error("list folder", resp.status, body)
+                        )
+                    try:
+                        data = json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        raise GDriveAPIError(
+                            f"Folder listing bukan JSON valid: {body[:200]}"
+                        ) from exc
+                items.extend(data.get("files") or [])
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+        return items
+
     async def get_metadata(self, file_id: str) -> dict[str, Any]:
         """Fetch ``files.get`` metadata for *file_id*."""
         url = f"{DRIVE_API_BASE}/files/{file_id}"

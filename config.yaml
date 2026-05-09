@@ -49,6 +49,10 @@ upload_targets:
     # Optional Folder ID untuk auto-foldering di player4me. Kosongkan bila
     # tidak butuh.
     default_folder_id: ""
+    # Default 2-char ISO 639-1 language code dipakai kalau ffprobe / nama
+    # file tidak menyebutkan bahasa subtitle (mis. "en", "ja"). Default
+    # "id" (Indonesia) sesuai kebutuhan utama bot.
+    default_subtitle_language: "id"
   local_only:
     enabled: true
 

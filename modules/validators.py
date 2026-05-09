@@ -16,6 +16,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 _GD_FILE_ID_RE = re.compile(
     r"(?:/d/|/file/d/|[?&](?:id|export=download&id)=)([A-Za-z0-9_-]{20,})"
 )
+_GD_FOLDER_ID_RE = re.compile(
+    r"(?:/folders/|[?&]folderId=)([A-Za-z0-9_-]{20,})"
+)
 _DROPBOX_RE = re.compile(r"^https?://(?:www\.)?(?:dropbox|dl\.dropboxusercontent)\.com/", re.I)
 _ONEDRIVE_RE = re.compile(r"^https?://(?:[^/]*\.)?(?:1drv\.ms|onedrive\.live\.com)/", re.I)
 _GD_HOST_RE = re.compile(r"^https?://(?:[^/]*\.)?(?:drive|docs)\.google\.com/", re.I)
@@ -23,9 +26,11 @@ _GD_HOST_RE = re.compile(r"^https?://(?:[^/]*\.)?(?:drive|docs)\.google\.com/", 
 
 @dataclass(frozen=True)
 class LinkInfo:
-    kind: str            # "google_drive" | "dropbox" | "onedrive" | "direct" | "ytdlp"
+    # "google_drive" | "google_drive_folder" | "dropbox" | "onedrive" | "direct" | "ytdlp"
+    kind: str
     url: str             # normalized URL ready to be passed to a downloader
     file_id: str | None = None
+    folder_id: str | None = None
 
 
 # ----- URL classification --------------------------------------------------- #
@@ -57,8 +62,28 @@ def extract_google_drive_id(url: str) -> str | None:
     return None
 
 
+def extract_google_drive_folder_id(url: str) -> str | None:
+    """Extract the folder ID from a Drive URL like
+    ``https://drive.google.com/drive/folders/<ID>?usp=sharing``."""
+    if not url:
+        return None
+    m = _GD_FOLDER_ID_RE.search(url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def is_google_drive_folder(url: str) -> bool:
+    return bool(_GD_HOST_RE.match(url or "")) and extract_google_drive_folder_id(url or "") is not None
+
+
 def is_google_drive(url: str) -> bool:
-    return bool(_GD_HOST_RE.match(url or "")) or extract_google_drive_id(url or "") is not None
+    if not url:
+        return False
+    if is_google_drive_folder(url):
+        # Folder URLs are still Drive but classified separately.
+        return False
+    return bool(_GD_HOST_RE.match(url)) or extract_google_drive_id(url) is not None
 
 
 def is_dropbox(url: str) -> bool:
@@ -101,6 +126,14 @@ def classify_link(
     """Classify *url* into one of the supported link kinds."""
     if not is_url(url):
         raise ValueError("URL tidak valid (harus diawali http:// atau https://)")
+
+    if allow_google_drive and is_google_drive_folder(url):
+        folder_id = extract_google_drive_folder_id(url) or ""
+        return LinkInfo(
+            kind="google_drive_folder",
+            url=url,
+            folder_id=folder_id or None,
+        )
 
     if allow_google_drive and is_google_drive(url):
         fid = extract_google_drive_id(url) or ""
