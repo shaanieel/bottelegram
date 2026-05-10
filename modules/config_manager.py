@@ -103,6 +103,8 @@ class Secrets:
     google_drive_service_account_json: str = ""
     google_drive_oauth_token_path: str = ""
     player4me_api_token: str = ""
+    tgindex_username: str = ""
+    tgindex_password: str = ""
 
     def values_to_redact(self) -> list[str]:
         out = [
@@ -110,6 +112,7 @@ class Secrets:
             self.bunny_api_key,
             self.google_drive_api_key,
             self.player4me_api_token,
+            self.tgindex_password,
         ]
         return [v for v in out if v]
 
@@ -197,6 +200,9 @@ class AppConfig:
                 self.secrets.google_drive_oauth_token_path
             ),
             "player4me_api_token_set": bool(self.secrets.player4me_api_token),
+            "tgindex_credentials_set": bool(
+                self.secrets.tgindex_username and self.secrets.tgindex_password
+            ),
         }
 
 
@@ -348,6 +354,8 @@ def load_config(
             "GOOGLE_DRIVE_OAUTH_TOKEN_PATH", ""
         ).strip(),
         player4me_api_token=os.getenv("PLAYER4ME_API_TOKEN", "").strip(),
+        tgindex_username=os.getenv("TGINDEX_USERNAME", "").strip(),
+        tgindex_password=os.getenv("TGINDEX_PASSWORD", "").strip(),
     )
 
     return AppConfig(
