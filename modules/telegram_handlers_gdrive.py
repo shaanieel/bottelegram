@@ -275,8 +275,9 @@ async def cmd_mirror_gdrive(
     chat_id = update.effective_chat.id if update.effective_chat else 0
     user = update.effective_user
 
-    # Enqueue satu job per file. Worker di BotApp._run_job akan handle
-    # download (lewat downloader.direct) dan dispatch ke run_mirror_gdrive.
+    # Enqueue satu job per file. Worker di BotApp._run_job akan dispatch
+    # MIRROR_GDRIVE early ke run_mirror_gdrive_full yang handle auth + download
+    # + upload Drive.
     job_ids: list[str] = []
     for tg_file in files:
         job = await bot_app.queue.enqueue(
@@ -287,13 +288,11 @@ async def cmd_mirror_gdrive(
             user_id=user.id if user else None,
             requested_by=(user.username or user.full_name) if user else None,
         )
-        # Simpan drive_folder_id + keyword di job supaya worker bisa baca.
-        # ``progress_text`` di-encode sebagai "GDRIVE_FOLDER:<id>" dan akan
-        # ditimpa oleh status update berikutnya — kita tidak menyimpan ID
-        # di sana untuk jangka panjang.
+        # Simpan target Drive folder + keyword di field dataclass dedicated
+        # supaya tidak ditimpa progress_text saat worker mulai jalan.
         await bot_app.queue._update(  # type: ignore[attr-defined]
             job,
-            progress_text=f"GDRIVE_FOLDER:{drive_folder_id}",
+            gdrive_target_folder_id=drive_folder_id or None,
             tgindex_keyword=keyword or None,
         )
         job_ids.append(job.job_id)
@@ -395,17 +394,12 @@ async def run_mirror_gdrive(
 ) -> None:
     """Upload file lokal ke Google Drive untuk ``JobType.MIRROR_GDRIVE``.
 
-    Folder tujuan diambil dari ``job.progress_text`` (encoded sebagai
-    ``"GDRIVE_FOLDER:<id>"`` saat enqueue), atau dari config default kalau
-    tidak ada.
+    Folder tujuan diambil dari ``job.gdrive_target_folder_id`` (di-set saat
+    enqueue oleh ``cmd_mirror_gdrive``), fallback ke
+    ``cfg.gdrive_upload.default_folder_id``, terakhir ``None`` (root Drive).
     """
 
-    drive_folder_id: Optional[str] = None
-    pt = job.progress_text or ""
-    if pt.startswith("GDRIVE_FOLDER:"):
-        raw_folder = pt.replace("GDRIVE_FOLDER:", "").strip()
-        drive_folder_id = raw_folder if raw_folder else None
-
+    drive_folder_id: Optional[str] = job.gdrive_target_folder_id or None
     if not drive_folder_id:
         drive_folder_id = bot_app.cfg.gdrive_upload.default_folder_id or None
 

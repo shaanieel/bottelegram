@@ -71,6 +71,7 @@ class Job:
     player4me_engine: Optional[str] = None
     gdrive_file_id: Optional[str] = None
     gdrive_web_link: Optional[str] = None
+    gdrive_target_folder_id: Optional[str] = None
     tgindex_keyword: Optional[str] = None
 
     def to_dict(self) -> dict:
