@@ -45,7 +45,7 @@ bottelegram/
     ├── downloader.py               # gdown / yt-dlp / direct downloader
     ├── gdrive_api.py               # Drive API client (download metadata)
     ├── gdrive_uploader.py          # Drive resumable upload (untuk /mirror_gdrive)
-    ├── tgindex_downloader.py       # Scrape zindex.aioarea.us.kg HTML
+    ├── tgindex_downloader.py       # Scrape zindex.aioarea.us.kg HTML + auto-login (TGIndexClient)
     ├── bunny_uploader.py           # Bunny Stream uploader
     ├── player4me_uploader.py       # Player4Me TUS + URL ingest
     ├── subtitle_extractor.py       # ffprobe + ffmpeg sub extract
@@ -137,18 +137,50 @@ User selalu memilih salah satu dari 2 mode subtitle dengan picker
 - `folder_id`: ID folder Drive tujuan (override `gdrive_upload.default_folder_id`
   di `config.yaml`). Kosongkan untuk root Drive.
 
-Setiap match → 1 job `MIRROR_GDRIVE`. Worker:
-1. Download file dari URL direct di index (lewat `download()` standar
-   `downloader.py`).
-2. Upload file lokal ke Drive lewat `GDriveUploader` (resumable upload Drive
+Setiap match → 1 job `MIRROR_GDRIVE`. Pipeline-nya **tidak** lewat
+`modules/downloader.py` (generic) karena halaman index biasanya butuh login
+dulu. Sebagai gantinya, `BotApp._run_job` mendispatch `MIRROR_GDRIVE` ke
+`run_mirror_gdrive_full` di `telegram_handlers_gdrive.py` (sama pola dengan
+`UPLOAD_PLAYER4ME_FOLDER`):
+
+1. Ambil/buat `TGIndexClient` (cached di `bot_app._tgindex_client`) dengan
+   `TGIndexCredentials` dari `.env` (`TGINDEX_USERNAME` /
+   `TGINDEX_PASSWORD`).
+2. Auto-login ke `<host>/login` saat cookie session belum ada / 401 / 302
+   ke `/login`. Cookie `TG_INDEX_SESSION` di-cache per origin.
+3. Download file dari `job.source_url` lewat `client.download_file()` —
+   ini yang menggantikan `download()` standar; auth cookie disertakan di
+   request, plus auto-retry 1x kalau di-redirect ke `/login` di tengah jalan.
+4. Upload file lokal ke Drive lewat `GDriveUploader` (resumable upload Drive
    API v3, butuh OAuth atau Service Account — API key tidak bisa upload).
-3. Auto delete file lokal kalau `app.auto_delete_after_upload=true`.
+5. Auto delete file lokal kalau `app.auto_delete_after_upload=true`.
 
 `MIRROR_GDRIVE` **tidak** lewat pengecekan `is_uploadable_video` — file apapun
 boleh masuk (sub, .nfo, sample, dll), karena user mungkin filter by keyword
 yang tidak mesti video.
 
-Preview tanpa download: `/gdrive_list URL_INDEX | keyword`.
+Preview tanpa download: `/gdrive_list URL_INDEX | keyword`. Command preview
+memakai `TGIndexClient` yang sama, jadi auto-login juga.
+
+#### Telegram Index auth (`TGINDEX_USERNAME` / `TGINDEX_PASSWORD`)
+
+Banyak instance Telegram Index sekarang wajib login. Login form-nya selalu
+`POST /login` dengan field `username`, `password`, `remember`, `redirect_to`.
+Setelah login server set cookie `TG_INDEX_SESSION` (HttpOnly). Bot:
+
+- Pakai `aiohttp.ClientSession(cookies=...)` saat request page maupun file.
+- Cache cookie di `TGIndexClient._cookies[origin]`. Reset on auth failure.
+- Detect login wall via 2 cara:
+  1. HTTP redirect (`302/303 Location: /login`).
+  2. Halaman 200-OK yang isinya form `<form action="/login">` (beberapa
+     instance render form login alih-alih redirect).
+- `TGIndexAuthError` (subclass `TGIndexError`) di-raise dengan pesan jelas
+  yang minta user set `TGINDEX_USERNAME` / `TGINDEX_PASSWORD`.
+
+Kalau user belum set credentials di `.env`:
+- `/gdrive_list` membalas error pesan auth yang ramah.
+- `/mirror_gdrive` job per file akan FAILED dengan error yang sama (tanpa
+  silent retry loop).
 
 ---
 
@@ -167,6 +199,8 @@ di `.env.example`.
 | `GOOGLE_DRIVE_API_KEY` | optional | Download Drive (file public) |
 | `GOOGLE_DRIVE_OAUTH_TOKEN_PATH` | optional | Download/upload Drive (file private user) — **direkomendasikan untuk Mode B & MIRROR_GDRIVE** |
 | `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` | optional | Alternatif OAuth (akses via SA) |
+| `TGINDEX_USERNAME` | optional | Username login Telegram Index (untuk `/gdrive_list` & `/mirror_gdrive`) |
+| `TGINDEX_PASSWORD` | optional | Password login Telegram Index. Wajib kalau halaman index butuh login. |
 
 Prioritas auth Drive: `OAuth token > Service Account > API key`. Untuk
 **upload** ke Drive (mirror_gdrive) atau **list folder** (mode B), API key
@@ -259,6 +293,18 @@ Worker job **tidak boleh** kirim `_safe_send` notifikasi completion sendiri.
 QueueManager akan trigger `BotApp._on_job_status_change` → `_send_completion`
 otomatis ketika job di-mark `COMPLETED`. Cukup update job status, biar
 QueueManager yang notify.
+
+### Pitfall #7 — Generic `download()` tidak tahu cookie auth
+
+`modules/downloader.py` `download()` adalah pipeline generic untuk URL
+public. Kalau host butuh **session cookie** (mis. Telegram Index pasca-update
+login), generic downloader akan mendarat di halaman `/login` dan return
+HTML alih-alih file. Solusi yang sudah dipakai untuk `MIRROR_GDRIVE`:
+bypass `download()` di `_run_job`, dispatch ke worker dedicated
+(`run_mirror_gdrive_full`) yang pakai `TGIndexClient` dengan cookie cache.
+Kalau ada source baru lain yang butuh cookie auth, pakai pola yang sama:
+modul khusus + dispatch dedicated di `_run_job` paling atas (sebelum panggil
+`download()`).
 
 ---
 

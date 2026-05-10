@@ -64,7 +64,10 @@ from .subtitle_extractor import (
     detect_language_from_filename,
     extract_embedded_subtitles,
 )
-from .telegram_handlers_gdrive import register_gdrive_handlers, run_mirror_gdrive
+from .telegram_handlers_gdrive import (
+    register_gdrive_handlers,
+    run_mirror_gdrive_full,
+)
 from .validators import (
     classify_link,
     is_url,
@@ -1145,6 +1148,14 @@ class BotApp:
             )
             return
 
+        # Telegram Index mirror also bypasses the generic downloader because
+        # the index hosts require an authenticated session cookie that the
+        # generic ``download()`` path doesn't know about. The full pipeline
+        # (login + download + upload-to-Drive) lives in ``telegram_handlers_gdrive``.
+        if job.type == JobType.MIRROR_GDRIVE.value:
+            await run_mirror_gdrive_full(self, job, progress, cancel_event)
+            return
+
         # 1) Download (single file)
         try:
             result = await download(
@@ -1177,13 +1188,7 @@ class BotApp:
             )
             return
 
-        # MIRROR_GDRIVE menerima file apapun dari index — tidak hanya video.
-        # Skip pengecekan ekstensi video supaya .srt / .nfo / sample lain
-        # juga ikut ter-upload ke Drive.
-        if (
-            job.type != JobType.MIRROR_GDRIVE.value
-            and not is_uploadable_video(result.path, self.cfg)
-        ):
+        if not is_uploadable_video(result.path, self.cfg):
             raise RuntimeError(
                 f"File {result.path.name} bukan video yang valid "
                 f"(ekstensi tidak didukung)."
@@ -1200,10 +1205,6 @@ class BotApp:
         elif job.type == JobType.UPLOAD_PLAYER4ME_SUBS.value:
             await self._run_upload_player4me_with_embedded_subs(
                 job, result.path, progress, cancel_event
-            )
-        elif job.type == JobType.MIRROR_GDRIVE.value:
-            await run_mirror_gdrive(
-                self, job, result.path, progress, cancel_event
             )
         else:
             raise RuntimeError(f"Tipe job tidak dikenali: {job.type}")

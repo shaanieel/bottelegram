@@ -34,8 +34,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from .gdrive_uploader import GDriveUploadError
 from .logger import get_logger
 from .queue_manager import Job, JobStatus, JobType
-from .storage_manager import human_bytes
-from .tgindex_downloader import TGIndexError, scrape_index
+from .storage_manager import human_bytes, safe_unlink
+from .tgindex_downloader import (
+    TGIndexAuthError,
+    TGIndexClient,
+    TGIndexCredentials,
+    TGIndexError,
+    TGIndexFile,
+)
 from .validators import is_url, safe_filename
 
 log = get_logger(__name__)
@@ -71,6 +77,32 @@ def _is_admin(bot_app, update: Update) -> bool:
     if user is None:
         return False
     return user.id in bot_app.cfg.secrets.admin_telegram_ids
+
+
+def _get_tgindex_client(bot_app) -> TGIndexClient:
+    """Lazy-init + cache TGIndexClient on bot_app, with credentials from .env.
+
+    The client caches login cookies so repeated scrape/download calls inside
+    the same bot session don't re-login on every request.
+    """
+    cli: Optional[TGIndexClient] = getattr(bot_app, "_tgindex_client", None)
+    if cli is not None:
+        return cli
+
+    creds: Optional[TGIndexCredentials] = None
+    secrets = bot_app.cfg.secrets
+    if secrets.tgindex_username and secrets.tgindex_password:
+        creds = TGIndexCredentials(
+            username=secrets.tgindex_username,
+            password=secrets.tgindex_password,
+        )
+
+    cli = TGIndexClient(
+        credentials=creds,
+        user_agent=bot_app.cfg.download.user_agent,
+    )
+    bot_app._tgindex_client = cli
+    return cli
 
 
 # ----- Command: /gdrive_list ------------------------------------------------ #
@@ -109,12 +141,19 @@ async def cmd_gdrive_list(
     sent = await msg.reply_text(
         f"Scraping index{hint}\u2026", parse_mode=ParseMode.HTML
     )
+    client = _get_tgindex_client(bot_app)
     try:
-        files = await scrape_index(
-            index_url,
-            keyword_filter=keyword or None,
-            user_agent=bot_app.cfg.download.user_agent,
+        files = await client.scrape_index(
+            index_url, keyword_filter=keyword or None,
         )
+    except TGIndexAuthError as exc:
+        await sent.edit_text(
+            f"Gagal scrape index (auth): {exc}\n\n"
+            "Set <code>TGINDEX_USERNAME</code> dan <code>TGINDEX_PASSWORD</code> "
+            "di .env lalu restart bot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     except TGIndexError as exc:
         await sent.edit_text(f"Gagal scrape index: {exc}")
         return
@@ -206,12 +245,19 @@ async def cmd_mirror_gdrive(
     hint = f" (filter: {keyword})" if keyword else ""
     sent = await msg.reply_text(f"Scraping index{hint}\u2026")
 
+    client = _get_tgindex_client(bot_app)
     try:
-        files = await scrape_index(
-            index_url,
-            keyword_filter=keyword or None,
-            user_agent=bot_app.cfg.download.user_agent,
+        files = await client.scrape_index(
+            index_url, keyword_filter=keyword or None,
         )
+    except TGIndexAuthError as exc:
+        await sent.edit_text(
+            f"Gagal scrape index (auth): {exc}\n\n"
+            "Set <code>TGINDEX_USERNAME</code> dan <code>TGINDEX_PASSWORD</code> "
+            "di .env lalu restart bot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     except TGIndexError as exc:
         await sent.edit_text(f"Gagal scrape index: {exc}")
         return
@@ -273,7 +319,71 @@ async def cmd_mirror_gdrive(
         bot_app._progress_msg[job_ids[0]] = (chat_id, sent.message_id)
 
 
-# ----- Worker: run_mirror_gdrive -------------------------------------------- #
+# ----- Worker: run_mirror_gdrive_full --------------------------------------- #
+
+
+async def run_mirror_gdrive_full(
+    bot_app,
+    job: Job,
+    progress: Callable[[str, Optional[float], str], Awaitable[None]],
+    cancel_event: asyncio.Event,
+) -> None:
+    """Full pipeline untuk ``JobType.MIRROR_GDRIVE``.
+
+    Tidak lewat :func:`modules.downloader.download` (generic) karena URL
+    download dari Telegram Index butuh **cookie session** yang sudah login.
+    Pipeline:
+
+    1. Ambil/buat :class:`TGIndexClient` (cached di ``bot_app``) dengan
+       credentials dari ``.env`` (``TGINDEX_USERNAME`` / ``TGINDEX_PASSWORD``).
+    2. Download file dari ``job.source_url`` lewat client (auto-login + retry
+       saat redirect ke ``/login``).
+    3. Upload file lokal ke Drive lewat :func:`run_mirror_gdrive`.
+    4. Auto-delete file lokal kalau ``app.auto_delete_after_upload=true``
+       (sama dengan path standar di ``BotApp._run_job``).
+    """
+    client = _get_tgindex_client(bot_app)
+    tg_file = TGIndexFile(
+        filename=job.title,
+        download_url=job.source_url,
+        size_text="",
+        file_type="",
+        position=0,
+    )
+
+    try:
+        local_path = await client.download_file(
+            tg_file,
+            bot_app.cfg.paths.download_dir,
+            bot_app.cfg.paths.temp_dir,
+            cfg=bot_app.cfg,
+            progress_cb=progress,
+            cancel_event=cancel_event,
+        )
+    except TGIndexAuthError as exc:
+        raise RuntimeError(
+            f"TGIndex auth gagal: {exc}. "
+            "Set TGINDEX_USERNAME / TGINDEX_PASSWORD di .env."
+        ) from exc
+    except TGIndexError as exc:
+        raise RuntimeError(f"TGIndex download gagal: {exc}") from exc
+
+    size_bytes = local_path.stat().st_size
+    await bot_app.queue._update(  # type: ignore[attr-defined]
+        job,
+        file_path=str(local_path),
+        file_size_bytes=size_bytes,
+        status=JobStatus.DOWNLOADED,
+        progress=100.0,
+        progress_text=f"Download selesai ({human_bytes(size_bytes)})",
+    )
+
+    await run_mirror_gdrive(bot_app, job, local_path, progress, cancel_event)
+
+    # Auto-delete file lokal (mirroring perilaku BotApp._run_job standar).
+    if bot_app.cfg.app.auto_delete_after_upload:
+        safe_unlink(local_path)
+        log.info("Auto-deleted local file %s", local_path)
 
 
 async def run_mirror_gdrive(
@@ -283,7 +393,7 @@ async def run_mirror_gdrive(
     progress: Callable[[str, Optional[float], str], Awaitable[None]],
     cancel_event: asyncio.Event,
 ) -> None:
-    """Worker untuk JobType.MIRROR_GDRIVE — upload file lokal ke Google Drive.
+    """Upload file lokal ke Google Drive untuk ``JobType.MIRROR_GDRIVE``.
 
     Folder tujuan diambil dari ``job.progress_text`` (encoded sebagai
     ``"GDRIVE_FOLDER:<id>"`` saat enqueue), atau dari config default kalau
@@ -323,9 +433,9 @@ async def run_mirror_gdrive(
         progress_text=f"Upload Drive selesai. File ID: {file_id}",
     )
 
-    # File lokal akan dihapus oleh ``_run_job`` (auto_delete_after_upload),
-    # jadi tidak perlu safe_unlink di sini supaya tidak double-delete.
-    # Notifikasi completion juga dikirim oleh ``_send_completion`` di BotApp.
+    # Notifikasi completion dikirim oleh ``_send_completion`` di BotApp.
+    # Auto-delete file lokal di-handle oleh caller (run_mirror_gdrive_full)
+    # atau oleh BotApp._run_job kalau dipanggil dari path lain.
 
 
 # ----- Helpers -------------------------------------------------------------- #
