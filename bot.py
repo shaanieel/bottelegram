@@ -21,6 +21,7 @@ from modules.config_manager import (
 )
 from modules.logger import get_logger, register_secrets, setup_logging
 from modules.telegram_handlers import BotApp
+from modules.live_queue_handlers import install_live_queue_handlers
 
 
 def _build_application(cfg: AppConfig) -> Application:
@@ -63,7 +64,15 @@ def main() -> int:
             return 2
 
     application = _build_application(cfg)
-    BotApp(cfg, application)
+
+    bot_app = BotApp(cfg, application)
+
+    # Tambahan fitur:
+    # - /cancel_<job_id>
+    # - /cancel_all
+    # - /queue_live dengan auto update + animasi loading
+    install_live_queue_handlers(bot_app)
+
     application.post_init = _post_init  # type: ignore[assignment]
 
     log.info("Bot ready, mulai polling…")
