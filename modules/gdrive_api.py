@@ -40,7 +40,7 @@ log = get_logger(__name__)
 ProgressCB = Optional[Callable[[str, Optional[float], str], Awaitable[None]]]
 
 DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
-OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+OAUTH_SCOPE = "https://www.googleapis.com/auth/drive"
 
 
 class GDriveAPIError(RuntimeError):
