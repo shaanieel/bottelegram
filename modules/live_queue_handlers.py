@@ -1,22 +1,14 @@
 """Live queue + quick cancel handlers.
 
-Fitur yang ditambahkan:
+Fitur:
 - /queue_live
-  Menampilkan 1 pesan antrean yang terus di-update otomatis.
-- /cancel_<job_id>
-  Contoh: /cancel_a5ebc3bb
-  Bisa langsung diklik dari pesan live queue.
 - /cancel_all
-  Membatalkan semua job yang queued / downloading / uploading / encoding.
-- Tombol inline "Cancel Semua Job" di /queue_live.
+- /cancel_<job_id>
+- tombol inline Cancel Semua Job
+- live queue auto update + animasi loading
 
-Cara pasang:
-1. Simpan file ini ke: modules/live_queue_handlers.py
-2. Di bot.py:
-   from modules.live_queue_handlers import install_live_queue_handlers
-
-   bot_app = BotApp(cfg, application)
-   install_live_queue_handlers(bot_app)
+File ini sengaja dibuat sebagai module tambahan agar telegram_handlers.py lama
+tidak perlu diubah.
 """
 
 from __future__ import annotations
@@ -24,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import html
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -60,25 +52,23 @@ SPINNER_FRAMES = ["⏳", "⌛", "🔄", "⬇️", "📥"]
 
 
 def install_live_queue_handlers(bot_app) -> None:
-    """Install live queue handlers ke BotApp tanpa mengubah telegram_handlers.py.
+    """Install live queue handlers ke BotApp.
 
-    Handler dipasang di group -1 supaya diproses sebelum fallback unknown command
-    yang sudah ada di telegram_handlers.py.
+    group=-1 dipakai supaya handler ini diproses sebelum fallback unknown command.
     """
     if getattr(bot_app, "_live_queue_handlers_installed", False):
         return
 
     bot_app._live_queue_handlers_installed = True
-    bot_app._live_queue_messages = {}          # chat_id -> message_id
-    bot_app._live_queue_last_text = {}         # chat_id -> last rendered html
-    bot_app._live_queue_last_edit = {}         # chat_id -> monotonic timestamp
+    bot_app._live_queue_messages = {}
+    bot_app._live_queue_last_text = {}
+    bot_app._live_queue_last_edit = {}
     bot_app._live_queue_spinner_index = 0
-    bot_app._live_queue_tasks = {}             # chat_id -> asyncio.Task
-    bot_app._live_queue_min_interval = 1.5     # anti flood edit Telegram
+    bot_app._live_queue_tasks = {}
+    bot_app._live_queue_min_interval = 1.5
 
     app = bot_app.application
 
-    # group=-1 supaya tidak ketahan MessageHandler(filters.COMMAND, cmd_unknown)
     app.add_handler(CommandHandler("queue_live", _cmd_queue_live(bot_app)), group=-1)
     app.add_handler(CommandHandler("cancel_all", _cmd_cancel_all(bot_app)), group=-1)
     app.add_handler(
@@ -98,9 +88,7 @@ def install_live_queue_handlers(bot_app) -> None:
 
 def _is_admin(bot_app, update: Update) -> bool:
     user = update.effective_user
-    if user is None:
-        return False
-    return user.id in bot_app.cfg.secrets.admin_telegram_ids
+    return bool(user and user.id in bot_app.cfg.secrets.admin_telegram_ids)
 
 
 def _cmd_queue_live(bot_app):
@@ -288,7 +276,6 @@ def _render_active_job(job: Job, spin: str) -> list[str]:
     if progress_text:
         lines.append(f"   <i>{progress_text}</i>")
 
-    # Ini sengaja format command tanpa spasi agar bisa diklik langsung di Telegram.
     lines.append(f"   Batalkan: /cancel_{job_id}")
     return lines
 
@@ -314,10 +301,8 @@ def _ensure_spinner_task(bot_app, chat_id: int) -> None:
     async def loop() -> None:
         while True:
             try:
-                # Kalau pesan live masih ada, tetap update spinner.
                 if chat_id not in bot_app._live_queue_messages:
                     return
-
                 await asyncio.sleep(2.0)
                 await _refresh_live_queue_messages(bot_app, only_chat_id=chat_id)
             except asyncio.CancelledError:
@@ -356,7 +341,6 @@ async def _refresh_live_queue_messages(
         text = _render_live_queue(bot_app)
         old = bot_app._live_queue_last_text.get(chat_id)
 
-        # Walaupun spinner berubah, kadang text bisa sama kalau belum masuk render.
         if old == text and not force:
             continue
 
@@ -372,8 +356,6 @@ async def _refresh_live_queue_messages(
             bot_app._live_queue_last_text[chat_id] = text
             bot_app._live_queue_last_edit[chat_id] = time.monotonic()
         except Exception as exc:
-            # Kalau message sudah dihapus / terlalu lama / tidak bisa diedit,
-            # jangan matikan bot. Cukup log debug.
             log.debug("Gagal edit live queue chat=%s msg=%s: %s", chat_id, message_id, exc)
 
 
@@ -389,7 +371,6 @@ def _wrap_queue_status_change(bot_app) -> None:
 
 
 def _wrap_publish_bot_commands(bot_app) -> None:
-    """Tambahkan command baru ke menu Telegram tanpa edit telegram_handlers.py."""
     old_publish = bot_app._publish_bot_commands
 
     async def wrapped_publish() -> None:
