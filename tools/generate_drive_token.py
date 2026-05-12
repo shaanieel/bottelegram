@@ -38,7 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CREDENTIALS = REPO_ROOT / "secrets" / "credentials.json"
 DEFAULT_TOKEN = REPO_ROOT / "secrets" / "token.pickle"
 
-OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def main() -> int:
