@@ -7,7 +7,6 @@ Usage::
 
 from __future__ import annotations
 
-import asyncio
 import sys
 
 from telegram.ext import Application, ApplicationBuilder
@@ -25,6 +24,7 @@ from modules.live_queue_handlers import install_live_queue_handlers
 from modules.advanced_mirror_handlers import install_advanced_mirror_handlers
 from modules.player4me_auto_subs import install_player4me_auto_subs
 from modules.reply_drive_handlers import install_reply_drive_handlers
+from modules.bot_http_api import start_bot_http_api
 
 
 def _build_application(cfg: AppConfig) -> Application:
@@ -35,6 +35,7 @@ def _build_application(cfg: AppConfig) -> Application:
 async def _post_init(application: Application) -> None:
     bot_app: BotApp = application.bot_data["bot_app"]
     await bot_app.start()
+    await start_bot_http_api(bot_app)
 
 
 def main() -> int:
@@ -94,27 +95,7 @@ def main() -> int:
     return 0
 
 
-def _configure_windows_event_loop() -> None:
-    """On Windows, prefer the selector loop for asyncio + aiohttp compatibility.
-
-    ``WindowsSelectorEventLoopPolicy`` is deprecated in Python 3.16 — silence
-    that warning since we still need it on supported versions.
-    """
-    if not sys.platform.startswith("win"):
-        return
-    import warnings
-
-    selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
-    if selector_policy is None:
-        return
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            asyncio.set_event_loop_policy(selector_policy())
-    except (AttributeError, NotImplementedError):
-        pass
-
-
 if __name__ == "__main__":
-    _configure_windows_event_loop()
+    # Do not force WindowsSelectorEventLoopPolicy here.
+    # asyncio subprocess is needed for ffprobe/ffmpeg subtitle extraction on Windows.
     raise SystemExit(main())
