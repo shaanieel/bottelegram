@@ -23,6 +23,7 @@ from modules.logger import get_logger, register_secrets, setup_logging
 from modules.telegram_handlers import BotApp
 from modules.live_queue_handlers import install_live_queue_handlers
 from modules.advanced_mirror_handlers import install_advanced_mirror_handlers
+from modules.player4me_auto_subs import install_player4me_auto_subs
 from modules.reply_drive_handlers import install_reply_drive_handlers
 
 
@@ -73,6 +74,7 @@ def main() -> int:
     # UX shortcuts before the older /m and unknown-command handlers.
     install_live_queue_handlers(bot_app)
     install_advanced_mirror_handlers(bot_app)
+    install_player4me_auto_subs(bot_app)
     install_reply_drive_handlers(bot_app)
 
     application.post_init = _post_init  # type: ignore[assignment]
