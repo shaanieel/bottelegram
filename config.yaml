@@ -1,8 +1,8 @@
 app:
   name: "ZAEIN Automation Bot"
   timezone: "Asia/Riyadh"
-  max_parallel_downloads: 1
-  max_parallel_uploads: 1
+  max_parallel_downloads: 5
+  max_parallel_uploads: 5
   auto_delete_after_upload: true
   history_size: 50
 
@@ -27,7 +27,7 @@ download:
   allow_ytdlp: true
   max_file_size_gb: 20
   request_timeout_seconds: 60
-  chunk_size_bytes: 1048576 # 1 MiB
+  chunk_size_bytes: 4194304 # 4 MiB
   user_agent: "Mozilla/5.0 (compatible; ZAEINBot/1.0)"
   prefer_gdrive_api: true
   gdrive_api_timeout_seconds: 30
@@ -47,8 +47,10 @@ upload_targets:
 # ----- Google Drive Upload (untuk fitur mirror_gdrive) -----
 gdrive_upload:
   # Folder ID tujuan default di Google Drive.
-  # Ambil dari URL: drive.google.com/drive/folders/<FOLDER_ID_DI_SINI>
   # Kosongkan ("") untuk upload ke root Drive.
+  # Advanced mirror panel bisa otomatis membuat folder:
+  # - ZaeinBot
+  # - ZaeinBot/VMX Zaein
   default_folder_id: ""
 
 video_extensions:
