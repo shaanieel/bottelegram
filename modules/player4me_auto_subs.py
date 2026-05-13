@@ -13,6 +13,7 @@ PUT /video/manage/{video_id}/subtitle.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import time
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from .gdrive_api import GDriveAPIClient
 from .logger import get_logger
 from .player4me_uploader import Player4MeError, Player4MeUploadResult
 from .queue_manager import Job, JobType
+from .storage_manager import safe_unlink
 from .subtitle_extractor import (
     SUPPORTED_SUB_EXTENSIONS,
     detect_language_from_filename,
@@ -36,6 +38,8 @@ log = get_logger(__name__)
 ProgressFn = Callable[[str, Optional[float], str], Awaitable[None]]
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 SUB_EXTS = set(SUPPORTED_SUB_EXTENSIONS) | {".sub"}
+BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "vtt", "mov_text", "text"}
 
 
 @dataclass
@@ -120,7 +124,7 @@ async def run_player4me_auto(bot_app, job: Job, cancel_event: asyncio.Event, pro
         )
         folder_id = bot_app.cfg.upload_targets.player4me_default_folder_id or None
         before_ids = await bot_app.player4me.snapshot_video_ids(folder_id=folder_id)
-        await progress("uploading", 0.0, f"Upload video ke Player4Me: {prepared.video_path.name}")
+        await progress("uploading", 0.0, f"Upload video ke Player4Me setelah cek subtitle: {prepared.video_path.name}")
         result = await bot_app.player4me.upload_local_file(
             prepared.video_path,
             prepared.video_title,
@@ -137,7 +141,7 @@ async def run_player4me_auto(bot_app, job: Job, cancel_event: asyncio.Event, pro
 
         uploaded = 0
         if prepared.subtitles:
-            await progress("encoding", 96.0, f"Upload {len(prepared.subtitles)} subtitle")
+            await progress("encoding", 96.0, f"Upload {len(prepared.subtitles)} subtitle ke Player4Me")
             for sub in prepared.subtitles:
                 if cancel_event.is_set():
                     raise Player4MeError("Job dibatalkan oleh user")
@@ -154,7 +158,7 @@ async def run_player4me_auto(bot_app, job: Job, cancel_event: asyncio.Event, pro
                     log.exception("Subtitle upload skipped: %s", sub.path)
                     await progress("encoding", None, f"Subtitle gagal dilewati: {sub.path.name} — {exc}")
         else:
-            await progress("encoding", 98.0, "Tidak ada subtitle; lanjut selesai")
+            await progress("encoding", 98.0, "Subtitle siap upload: 0. Video tetap diselesaikan.")
 
         await bot_app.queue._update(
             job,
@@ -209,7 +213,7 @@ async def _prepare_drive_folder(bot_app, job: Job, folder_id: str, cancel_event:
     cleanup = [target]
 
     if subs:
-        await progress("downloading", None, f"Download {len(subs)} sidecar subtitle")
+        await progress("downloading", None, f"Sidecar subtitle ditemukan: {len(subs)}. Download subtitle tanpa ffmpeg.")
         for sub in subs:
             sub_name = str(sub.get("name") or "subtitle.srt")
             sub_title = safe_filename(Path(sub_name).stem) or "subtitle"
@@ -218,10 +222,12 @@ async def _prepare_drive_folder(bot_app, job: Job, folder_id: str, cancel_event:
                 lang, label = _detect_language(sub_path.name, bot_app.cfg.upload_targets.player4me_default_subtitle_language)
                 subtitle_assets.append(SubtitleAsset(sub_path, lang, label, "sidecar"))
                 cleanup.append(sub_path)
+                await progress("encoding", None, f"Subtitle sidecar siap: {sub_path.name} ({lang})")
             except Exception as exc:
                 log.exception("Download sidecar subtitle failed: %s", sub_name)
                 await progress("downloading", None, f"Subtitle sidecar dilewati: {sub_name} — {exc}")
     else:
+        await progress("encoding", None, "Folder tidak punya sidecar subtitle. Cek embed subtitle dulu.")
         subtitle_assets = await _extract_embedded(bot_app, target, progress)
         cleanup.extend(s.path for s in subtitle_assets)
 
@@ -229,8 +235,35 @@ async def _prepare_drive_folder(bot_app, job: Job, folder_id: str, cancel_event:
 
 
 async def _extract_embedded(bot_app, video_path: Path, progress: ProgressFn) -> list[SubtitleAsset]:
-    await progress("encoding", None, "Cek subtitle embed dengan ffprobe/ffmpeg")
+    await progress("encoding", 90.0, f"🔎 Cek subtitle embed dengan ffprobe: {video_path.name}")
     out_dir = bot_app.cfg.paths.temp_dir / f"subs-{int(time.time())}-{video_path.stem[:24]}"
+
+    streams = await _probe_subtitle_streams(video_path, progress)
+    if not streams:
+        await progress(
+            "encoding",
+            92.0,
+            "Subtitle stream ditemukan: 0. Kemungkinan hardsub / subtitle sudah nempel di video.",
+        )
+        return []
+
+    text_streams = [s for s in streams if str(s.get("codec_name") or "").lower() in TEXT_SUB_CODECS]
+    bitmap_streams = [s for s in streams if str(s.get("codec_name") or "").lower() in BITMAP_SUB_CODECS]
+    await progress(
+        "encoding",
+        92.0,
+        f"Subtitle stream ditemukan: {len(streams)} | text: {len(text_streams)} | bitmap: {len(bitmap_streams)}",
+    )
+
+    if not text_streams:
+        await progress(
+            "encoding",
+            93.0,
+            "Ada subtitle, tapi bukan text subtitle. PGS/VobSub bitmap dilewati karena butuh OCR.",
+        )
+        return []
+
+    await progress("encoding", 94.0, "Mulai extract subtitle text dengan ffmpeg...")
     try:
         extracted = await extract_embedded_subtitles(
             video_path,
@@ -240,14 +273,49 @@ async def _extract_embedded(bot_app, video_path: Path, progress: ProgressFn) -> 
         )
     except Exception as exc:
         log.exception("Embedded subtitle extraction failed: %s", video_path)
-        await progress("encoding", None, f"Cek subtitle gagal, upload video saja: {exc}")
+        await progress("encoding", None, f"Extract subtitle gagal, upload video saja: {exc}")
         return []
+
     out: list[SubtitleAsset] = []
     for item in extracted:
         lang, label = _detect_language(item.path.name, item.language or "id")
         out.append(SubtitleAsset(item.path, lang, label or item.name, "embedded"))
-    await progress("encoding", None, f"Subtitle embed ditemukan: {len(out)}")
+        await progress("encoding", None, f"Subtitle extracted: {item.path.name} ({lang})")
+    await progress("encoding", 95.0, f"Subtitle siap upload: {len(out)}")
     return out
+
+
+async def _probe_subtitle_streams(video_path: Path, progress: ProgressFn) -> list[dict]:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_streams",
+        "-select_streams", "s",
+        str(video_path),
+    ]
+    await progress("encoding", None, "Menjalankan ffprobe untuk membaca subtitle stream...")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        await progress("encoding", None, "ffprobe tidak ditemukan di PATH. Install ffmpeg dulu.")
+        raise Player4MeError("ffprobe tidak ditemukan di PATH. Install ffmpeg dan restart bot.")
+
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace")[:300]
+        await progress("encoding", None, f"ffprobe gagal: {detail}")
+        raise Player4MeError(f"ffprobe gagal: {detail}")
+    try:
+        data = json.loads(stdout.decode("utf-8", errors="replace") or "{}")
+    except json.JSONDecodeError as exc:
+        raise Player4MeError(f"ffprobe output bukan JSON valid: {exc}") from exc
+    streams = data.get("streams") or []
+    return [s for s in streams if isinstance(s, dict)]
 
 
 async def _resolve_video_id(bot_app, result: Player4MeUploadResult, prepared: PreparedMedia, before_ids: set[str], folder_id: Optional[str]) -> Optional[str]:
