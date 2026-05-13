@@ -24,6 +24,7 @@ from modules.live_queue_handlers import install_live_queue_handlers
 from modules.advanced_mirror_handlers import install_advanced_mirror_handlers
 from modules.player4me_auto_subs import install_player4me_auto_subs
 from modules.reply_drive_handlers import install_reply_drive_handlers
+from modules.bot_http_api import start_bot_http_api
 
 
 def _build_application(cfg: AppConfig) -> Application:
@@ -34,6 +35,7 @@ def _build_application(cfg: AppConfig) -> Application:
 async def _post_init(application: Application) -> None:
     bot_app: BotApp = application.bot_data["bot_app"]
     await bot_app.start()
+    await start_bot_http_api(bot_app)
 
 
 def main() -> int:
