@@ -22,6 +22,7 @@ from modules.config_manager import (
 from modules.logger import get_logger, register_secrets, setup_logging
 from modules.telegram_handlers import BotApp
 from modules.live_queue_handlers import install_live_queue_handlers
+from modules.advanced_mirror_handlers import install_advanced_mirror_handlers
 from modules.reply_drive_handlers import install_reply_drive_handlers
 
 
@@ -68,13 +69,10 @@ def main() -> int:
 
     bot_app = BotApp(cfg, application)
 
-    # Tambahan fitur:
-    # - /queue_live
-    # - /cancel_all
-    # - /cancel_<job_id>
-    # - reply pesan berisi link Telegram Index lalu ketik /m
-    #   untuk pilih Upload ke Google Drive.
+    # Add-on handlers are installed with negative groups so they can intercept
+    # UX shortcuts before the older /m and unknown-command handlers.
     install_live_queue_handlers(bot_app)
+    install_advanced_mirror_handlers(bot_app)
     install_reply_drive_handlers(bot_app)
 
     application.post_init = _post_init  # type: ignore[assignment]

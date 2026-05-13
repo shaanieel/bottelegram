@@ -1,4 +1,4 @@
-"""Live queue + quick cancel handlers.
+"""Live queue monitor + quick cancel handlers.
 
 Fitur:
 - /queue_live
@@ -6,15 +6,16 @@ Fitur:
 - /cancel_<job_id>
 - tombol inline Cancel Semua Job
 - live queue auto update + animasi loading
-
-File ini sengaja dibuat sebagai module tambahan agar telegram_handlers.py lama
-tidak perlu diubah.
+- pagination Prev/Next kalau job banyak
+- ringkasan system CPU/RAM/disk/network best-effort
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
+import os
+import shutil
 import time
 from typing import Optional
 
@@ -49,6 +50,7 @@ CANCELLABLE_STATUSES = {
 }
 
 SPINNER_FRAMES = ["⏳", "⌛", "🔄", "⬇️", "📥"]
+PAGE_SIZE = 5
 
 
 def install_live_queue_handlers(bot_app) -> None:
@@ -65,6 +67,8 @@ def install_live_queue_handlers(bot_app) -> None:
     bot_app._live_queue_last_edit = {}
     bot_app._live_queue_spinner_index = 0
     bot_app._live_queue_tasks = {}
+    bot_app._live_queue_page = {}
+    bot_app._live_queue_net_last = None
     bot_app._live_queue_min_interval = 1.5
 
     app = bot_app.application
@@ -104,12 +108,13 @@ def _cmd_queue_live(bot_app):
             return
 
         chat_id = chat.id
-        text = _render_live_queue(bot_app)
+        bot_app._live_queue_page[chat_id] = 0
+        text = _render_live_queue(bot_app, chat_id=chat_id)
 
         sent = await msg.reply_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=_keyboard(),
+            reply_markup=_keyboard(chat_id, bot_app),
             disable_web_page_preview=True,
         )
 
@@ -173,7 +178,9 @@ def _cb_live_queue(bot_app):
             await query.answer("Akses ditolak.", show_alert=True)
             return
 
-        action = query.data.split(":", 1)[1]
+        parts = query.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        chat_id = query.message.chat_id if query.message else None
 
         if action == "cancel_all":
             count = await _cancel_all_jobs(bot_app)
@@ -184,6 +191,19 @@ def _cb_live_queue(bot_app):
         if action == "refresh":
             await query.answer("Refresh antrean.")
             await _refresh_live_queue_messages(bot_app, force=True)
+            return
+
+        if action in {"next", "prev"} and chat_id is not None:
+            all_jobs = _display_jobs(bot_app)
+            max_page = max(0, (len(all_jobs) - 1) // PAGE_SIZE)
+            cur = int(bot_app._live_queue_page.get(chat_id, 0))
+            if action == "next":
+                cur = min(max_page, cur + 1)
+            else:
+                cur = max(0, cur - 1)
+            bot_app._live_queue_page[chat_id] = cur
+            await query.answer(f"Halaman {cur + 1}/{max_page + 1}")
+            await _refresh_live_queue_messages(bot_app, force=True, only_chat_id=chat_id)
             return
 
         await query.answer("Aksi tidak dikenal.", show_alert=True)
@@ -202,89 +222,187 @@ async def _cancel_all_jobs(bot_app) -> int:
     return count
 
 
-def _keyboard() -> InlineKeyboardMarkup:
+def _keyboard(chat_id: int, bot_app) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("⬅️ Prev", callback_data="livequeue:prev"),
+                InlineKeyboardButton("➡️ Next", callback_data="livequeue:next"),
+            ],
+            [
                 InlineKeyboardButton("🔄 Refresh", callback_data="livequeue:refresh"),
                 InlineKeyboardButton("❌ Cancel Semua Job", callback_data="livequeue:cancel_all"),
-            ]
+            ],
         ]
     )
 
 
-def _render_live_queue(bot_app) -> str:
+def _display_jobs(bot_app) -> list[Job]:
+    active = bot_app.queue.active_jobs()
+    queued = bot_app.queue.queued_jobs()
+    return active + queued
+
+
+def _render_live_queue(bot_app, *, chat_id: Optional[int] = None) -> str:
     bot_app._live_queue_spinner_index = (
         bot_app._live_queue_spinner_index + 1
     ) % len(SPINNER_FRAMES)
     spin = SPINNER_FRAMES[bot_app._live_queue_spinner_index]
 
-    active = bot_app.queue.active_jobs()
-    queued = bot_app.queue.queued_jobs()
+    jobs = _display_jobs(bot_app)
+    active = [j for j in jobs if j.status in ACTIVE_STATUSES]
+    queued = [j for j in jobs if j.status == JobStatus.QUEUED.value]
+
+    page = int(bot_app._live_queue_page.get(chat_id, 0)) if chat_id is not None else 0
+    max_page = max(0, (len(jobs) - 1) // PAGE_SIZE)
+    page = max(0, min(page, max_page))
+    if chat_id is not None:
+        bot_app._live_queue_page[chat_id] = page
+    start = page * PAGE_SIZE
+    visible = jobs[start : start + PAGE_SIZE]
 
     lines: list[str] = []
-    lines.append("<b>Antrean Live</b>")
-    lines.append(f"<i>Auto update aktif {spin}</i>")
+    lines.append("<b>📊 ZAEIN Task Monitor</b>")
+    lines.append(f"<i>Live update {spin}</i>")
     lines.append("")
 
-    if active:
-        lines.append("<b>Sedang berjalan</b>")
-        for job in active[:6]:
-            lines.extend(_render_active_job(job, spin))
+    if visible:
+        for job in visible:
+            lines.extend(_render_job(job, spin))
+            lines.append("")
     else:
-        lines.append("<b>Sedang berjalan</b>")
-        lines.append("Tidak ada job aktif.")
+        lines.append("Tidak ada job aktif / antrean.")
+        lines.append("")
 
+    lines.append(f"<b>Step:</b> {page + 1}")
+    lines.append(f"<b>Halaman:</b> {page + 1}/{max_page + 1}")
+    lines.append(f"<b>Total Tugas:</b> {len(jobs)} | Aktif: {len(active)} | Tunggu: {len(queued)}")
     lines.append("")
-    lines.append("<b>Menunggu</b>")
-
-    if queued:
-        for job in queued[:30]:
-            lines.append(
-                "• "
-                f"<code>{html.escape(job.job_id)}</code> "
-                f"[{html.escape(job.type)}] "
-                f"{html.escape(_short(job.title, 72))}"
-            )
-        if len(queued) > 30:
-            lines.append(f"… dan {len(queued) - 30} job lainnya.")
-    else:
-        lines.append("Tidak ada antrean.")
-
+    lines.extend(_system_lines(bot_app))
     lines.append("")
-    lines.append(f"Total aktif: <b>{len(active)}</b> | Menunggu: <b>{len(queued)}</b>")
     lines.append("Cancel semua: /cancel_all")
 
     return "\n".join(lines)
 
 
-def _render_active_job(job: Job, spin: str) -> list[str]:
+def _render_job(job: Job, spin: str) -> list[str]:
     pct = int(job.progress or 0)
     bar = _progress_bar(pct)
+    status_label = _status_label(job.status)
 
-    status = html.escape(job.status)
     job_id = html.escape(job.job_id)
-    title = html.escape(_short(job.title, 78))
+    title = html.escape(_short(job.title, 64))
     progress_text = html.escape(_short(job.progress_text or "", 90))
 
     lines = [
-        f"{spin} <code>{job_id}</code> [{html.escape(job.type)}] {status} {pct}%",
-        f"{bar}",
-        f"🎬 {title}",
+        "🔐 <b>Nama:</b> <code>Private Task</code>",
+        f"├ <b>Status:</b> {status_label} ({pct:.0f}%)",
+        f"├ <code>{bar}</code>",
+        f"├ <b>Judul:</b> {title}",
+        f"├ <b>Ukuran:</b> {_human_size(job.file_size_bytes)}",
+        f"├ <b>Engine:</b> {_engine_for(job)}",
+        f"├ <b>Mode:</b> #{html.escape(job.type)}",
     ]
-
     if progress_text:
-        lines.append(f"   <i>{progress_text}</i>")
-
-    lines.append(f"   Batalkan: /cancel_{job_id}")
+        lines.append(f"├ <b>Info:</b> <i>{progress_text}</i>")
+    lines.append(f"└ ⛔ /cancel_{job_id}")
     return lines
+
+
+def _status_label(status: str) -> str:
+    return {
+        JobStatus.QUEUED.value: "Queued",
+        JobStatus.DOWNLOADING.value: "Downloading",
+        JobStatus.DOWNLOADED.value: "Downloaded",
+        JobStatus.UPLOADING.value: "Uploading",
+        JobStatus.ENCODING.value: "Processing",
+        JobStatus.COMPLETED.value: "Completed",
+        JobStatus.FAILED.value: "Failed",
+        JobStatus.CANCELLED.value: "Cancelled",
+    }.get(status, status)
+
+
+def _engine_for(job: Job) -> str:
+    if job.type == "mirror_gdrive":
+        if job.status in {JobStatus.DOWNLOADING.value, JobStatus.DOWNLOADED.value}:
+            return "TGIndex + aiohttp"
+        return "Google Drive Resumable"
+    if "player4me" in job.type:
+        return "Player4Me TUS"
+    if "bunny" in job.type:
+        return "Bunny Stream"
+    return "aiohttp / yt-dlp"
 
 
 def _progress_bar(percent: int, width: int = 12) -> str:
     percent = max(0, min(100, int(percent)))
     filled = round((percent / 100) * width)
     empty = width - filled
-    return "   " + ("█" * filled) + ("░" * empty) + f" {percent}%"
+    return ("█" * filled) + ("░" * empty)
+
+
+def _human_size(value: Optional[int]) -> str:
+    if not value:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.2f}{unit}"
+        size /= 1024
+    return f"{value}B"
+
+
+def _system_lines(bot_app) -> list[str]:
+    cpu = "?"
+    ram = "?"
+    try:
+        import psutil  # type: ignore
+
+        cpu = f"{psutil.cpu_percent(interval=None):.1f}%"
+        ram = f"{psutil.virtual_memory().percent:.1f}%"
+    except Exception:
+        pass
+
+    try:
+        usage = shutil.disk_usage(bot_app.cfg.paths.download_dir)
+        free = _human_size(usage.free)
+    except Exception:
+        free = "?"
+
+    down = up = "?"
+    try:
+        import psutil  # type: ignore
+
+        now = time.monotonic()
+        net = psutil.net_io_counters()
+        last = getattr(bot_app, "_live_queue_net_last", None)
+        if last:
+            last_t, last_sent, last_recv = last
+            dt = max(0.1, now - last_t)
+            down = f"{_human_size(int((net.bytes_recv - last_recv) / dt))}/s"
+            up = f"{_human_size(int((net.bytes_sent - last_sent) / dt))}/s"
+        bot_app._live_queue_net_last = (now, net.bytes_sent, net.bytes_recv)
+    except Exception:
+        pass
+
+    return [
+        "<b>╭─ SYSTEM</b>",
+        f"├ 🔴 Cpu  [{_mini_bar(cpu)}] {html.escape(cpu)}",
+        f"├ 🟢 Ram  [{_mini_bar(ram)}] {html.escape(ram)}",
+        f"├ 🟢 Free [{_mini_bar('0')}] {html.escape(free)}",
+        f"├ ⚡ Spd ↓ {html.escape(down)} ↑ {html.escape(up)}",
+        f"└ 🌐 Net best-effort",
+    ]
+
+
+def _mini_bar(percent_text: str, width: int = 10) -> str:
+    try:
+        val = float(str(percent_text).replace("%", ""))
+    except Exception:
+        val = 0.0
+    filled = round((max(0.0, min(100.0, val)) / 100) * width)
+    return "■" * filled + "□" * (width - filled)
 
 
 def _short(text: str, limit: int) -> str:
@@ -338,7 +456,7 @@ async def _refresh_live_queue_messages(
             if now - last_edit < bot_app._live_queue_min_interval:
                 continue
 
-        text = _render_live_queue(bot_app)
+        text = _render_live_queue(bot_app, chat_id=chat_id)
         old = bot_app._live_queue_last_text.get(chat_id)
 
         if old == text and not force:
@@ -350,7 +468,7 @@ async def _refresh_live_queue_messages(
                 message_id=message_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=_keyboard(),
+                reply_markup=_keyboard(chat_id, bot_app),
                 disable_web_page_preview=True,
             )
             bot_app._live_queue_last_text[chat_id] = text
