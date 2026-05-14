@@ -59,6 +59,32 @@ def _clean_tier(value: Any) -> str:
     return "free" if tier == "free" else "vip"
 
 
+def _pick_player_domain(body: dict[str, Any]) -> str:
+    """Cari domain Player4Me pilihan dari beberapa kemungkinan field.
+
+    Drive web mengirim payload dengan beberapa alias supaya kompatibel:
+    `player_domain`, `domain`, `player4me_domain`, `selected_domain`, atau
+    nested di `player4me.domain`. Bot harus baca yang pertama isinya supaya
+    `webstream_importer._public_player_url` bisa membangun link final
+    `https://<domain>/#<videoId>` (bukan `player4me.com/embed/<videoId>`).
+    """
+    candidates: list[Any] = [
+        body.get("player_domain"),
+        body.get("domain"),
+        body.get("player4me_domain"),
+        body.get("selected_domain"),
+    ]
+    nested = body.get("player4me") or {}
+    if isinstance(nested, dict):
+        candidates.append(nested.get("domain"))
+        candidates.append(nested.get("player_domain"))
+    for raw in candidates:
+        value = str(raw or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _job_to_dict(job: Job) -> dict[str, Any]:
     meta = getattr(job, "stream_meta", None) or {}
     tmdb = meta.get("tmdb") or {}
@@ -94,12 +120,22 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
 def _build_stream_meta(body: dict[str, Any], *, kind: str, season: int | None = None, episode: int | None = None) -> dict[str, Any]:
     tmdb = body.get("tmdb") or {}
     title = str(tmdb.get("title") or body.get("title") or "").strip()
+    player_domain = _pick_player_domain(body)
     return {
         "kind": kind,
         "target": str(body.get("target") or "player4me").lower().strip(),
         "tier": _clean_tier(body.get("tier")),
         "season": season,
         "episode": episode,
+        # Sertakan domain pilihan dengan beberapa alias supaya semua consumer
+        # (webstream_importer, dst.) bisa membaca tanpa peduli alias mana yang
+        # mereka pakai. Tanpa ini, link final di Supabase `films.drive_link`
+        # akan jatuh ke `https://player4me.com/embed/<id>` (default embed),
+        # bukan `https://<domain>/#<id>` yang user pilih di Drive web.
+        "player_domain": player_domain,
+        "domain": player_domain,
+        "player4me_domain": player_domain,
+        "selected_domain": player_domain,
         "tmdb": {
             "id": tmdb.get("id"),
             "type": tmdb.get("type") or ("tv" if kind == "series" else "movie"),
