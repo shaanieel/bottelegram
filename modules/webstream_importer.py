@@ -1,15 +1,13 @@
 """Auto insert uploaded Player4Me videos into ZAEIN webstream catalog.
 
-The Drive web already sends TMDB metadata to the bot HTTP API. The bot keeps
-that metadata on the in-memory Job object, then after Player4Me upload succeeds
-this helper inserts one row into the webstream Supabase `films` table.
+The Drive web sends TMDB metadata and the selected Player4Me public domain to
+the bot HTTP API. The bot keeps that metadata on the in-memory Job object, then
+after Player4Me upload succeeds this helper inserts one row into the webstream
+Supabase `films` table.
 
 Required env on the RDP bot:
     SUPABASE_URL or WEBSTREAM_SUPABASE_URL
     SUPABASE_SERVICE_KEY or WEBSTREAM_SUPABASE_SERVICE_KEY
-
-Recommended env:
-    PLAYER4ME_PUBLIC_DOMAIN=zaeinstore.qzz.io
 
 No browser secret is involved here; this runs only on the RDP/VPS bot.
 """
@@ -37,9 +35,21 @@ def _env(*names: str) -> str:
     return ""
 
 
-def _public_player_url(video_id: str) -> str:
-    domain = _env("PLAYER4ME_PUBLIC_DOMAIN", "P4M_PUBLIC_DOMAIN")
+def _normalize_domain(raw: Any) -> str:
+    domain = str(raw or "").strip()
+    if not domain:
+        return ""
     domain = domain.replace("https://", "").replace("http://", "").strip("/")
+    return domain
+
+
+def _public_player_url(video_id: str, meta: dict[str, Any]) -> str:
+    domain = _normalize_domain(
+        meta.get("player_domain")
+        or meta.get("domain")
+        or meta.get("player4me_domain")
+        or meta.get("selected_domain")
+    )
     if domain and video_id:
         return f"https://{domain}/#{video_id}"
     return ""
@@ -67,10 +77,10 @@ def _row_from_job(job: Job, video_id: str) -> dict[str, Any] | None:
     if not title:
         title = "Untitled"
 
-    stream_url = job.embed_url or _public_player_url(video_id)
+    stream_url = job.embed_url or _public_player_url(video_id, meta)
     if not stream_url:
-        # Keep a deterministic fallback; admin can still edit later if the
-        # custom domain is not set. Better than inserting an empty link.
+        # Fallback hanya dipakai jika Drive web belum mengirim domain. Normalnya
+        # domain dipilih dari tabel player4me_domains, misalnya zaeinstore.qzz.io.
         stream_url = f"https://player4me.com/embed/{video_id}"
 
     row: dict[str, Any] = {
