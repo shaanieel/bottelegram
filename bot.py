@@ -25,11 +25,32 @@ from modules.advanced_mirror_handlers import install_advanced_mirror_handlers
 from modules.player4me_auto_subs import install_player4me_auto_subs
 from modules.reply_drive_handlers import install_reply_drive_handlers
 from modules.bot_http_api import start_bot_http_api
+from modules.queue_manager import JobType
+from modules.webstream_importer import maybe_insert_webstream
 
 
 def _build_application(cfg: AppConfig) -> Application:
     builder = ApplicationBuilder().token(cfg.secrets.telegram_bot_token)
     return builder.build()
+
+
+def install_webstream_auto_insert(bot_app: BotApp) -> None:
+    """After Player4Me upload jobs finish, insert Drive-web jobs into webstream."""
+    if getattr(bot_app, "_webstream_auto_insert_installed", False):
+        return
+    bot_app._webstream_auto_insert_installed = True
+    old_worker = bot_app.queue._worker
+
+    async def wrapped(job, cancel_event, progress):
+        await old_worker(job, cancel_event, progress)
+        if job.type in {
+            JobType.UPLOAD_PLAYER4ME.value,
+            JobType.UPLOAD_PLAYER4ME_SUBS.value,
+            JobType.UPLOAD_PLAYER4ME_FOLDER.value,
+        } and getattr(job, "stream_meta", None) and job.player4me_video_id:
+            await maybe_insert_webstream(bot_app, job, job.player4me_video_id, progress)
+
+    bot_app.queue._worker = wrapped
 
 
 async def _post_init(application: Application) -> None:
@@ -76,6 +97,7 @@ def main() -> int:
     install_live_queue_handlers(bot_app)
     install_advanced_mirror_handlers(bot_app)
     install_player4me_auto_subs(bot_app)
+    install_webstream_auto_insert(bot_app)
     install_reply_drive_handlers(bot_app)
 
     application.post_init = _post_init  # type: ignore[assignment]
