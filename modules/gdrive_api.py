@@ -375,7 +375,20 @@ class GDriveAPIClient:
         )
 
         written = 0
-        last_pct = -1
+        last_pct_emitted = -1.0
+        # Throttle progress emits to keep Telegram from flood-controlling the
+        # task-monitor message while still giving the user visible movement.
+        # We emit when either (a) we cross a 1% boundary or (b) at least
+        # 5 seconds have passed since the last emit. 5 % was way too sparse
+        # for multi-GB files (one update every several minutes at typical
+        # GDrive API speeds), which made the UI look frozen.
+        emit_min_interval_sec = 5.0
+        emit_min_pct_step = 1.0
+        loop = asyncio.get_running_loop()
+        t_started = loop.time()
+        last_emit_time = t_started
+        last_log_time = t_started
+        last_log_bytes = 0
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(
@@ -405,18 +418,58 @@ class GDriveAPIClient:
                                     f"File melewati limit "
                                     f"{self.cfg.download.max_file_size_gb} GB"
                                 )
+                            now = loop.time()
+                            # Emit a Telegram-visible progress update at most
+                            # once per 5 s and at least once per 1 % boundary.
                             if total:
                                 pct = (written / total) * 100
-                                ipct = int(pct)
-                                if ipct != last_pct and ipct % 5 == 0:
-                                    last_pct = ipct
+                                pct_step_ok = (
+                                    pct - last_pct_emitted >= emit_min_pct_step
+                                )
+                                time_step_ok = (
+                                    now - last_emit_time >= emit_min_interval_sec
+                                )
+                                if pct_step_ok or time_step_ok:
+                                    speed_bps = (
+                                        (written - last_log_bytes)
+                                        / max(0.001, now - last_log_time)
+                                    )
                                     await _emit(
                                         progress_cb,
                                         "downloading",
                                         pct,
-                                        f"GDriveAPI {ipct}% "
-                                        f"({human_bytes(written)}/{human_bytes(total)})",
+                                        f"GDriveAPI {pct:.1f}% "
+                                        f"({human_bytes(written)}/{human_bytes(total)}) "
+                                        f"\u2022 {human_bytes(int(speed_bps))}/s",
                                     )
+                                    last_pct_emitted = pct
+                                    last_emit_time = now
+                            # Periodic INFO log so the user can watch real
+                            # bytes/sec in the cmd window even if Telegram
+                            # message edits are throttled by flood control.
+                            if now - last_log_time >= 10.0:
+                                speed_bps = (
+                                    (written - last_log_bytes)
+                                    / max(0.001, now - last_log_time)
+                                )
+                                if total:
+                                    log.info(
+                                        "GDriveAPI download progress: %s / %s "
+                                        "(%.1f%%) speed %s/s",
+                                        human_bytes(written),
+                                        human_bytes(total),
+                                        (written / total) * 100,
+                                        human_bytes(int(speed_bps)),
+                                    )
+                                else:
+                                    log.info(
+                                        "GDriveAPI download progress: %s "
+                                        "speed %s/s",
+                                        human_bytes(written),
+                                        human_bytes(int(speed_bps)),
+                                    )
+                                last_log_time = now
+                                last_log_bytes = written
             tmp.replace(target)
         except Exception:
             safe_unlink(tmp)

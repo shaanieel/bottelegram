@@ -285,13 +285,56 @@ class BotApp:
         log.exception("Unhandled error: %s", err)
 
     async def cmd_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Fallback handler for unrecognized ``/something`` commands.
+
+        We previously replied "Command tidak dikenal" to admins, which got
+        the bot flood-controlled by Telegram (RetryAfter 9000+ s) when an
+        admin pasted a stray block of slash commands or a buggy client
+        retried the same /something rapidly. Telegram's anti-spam treats
+        repeated reply_text to the same chat as flooding and locks send
+        for hours, blocking ALL legitimate notifications including job
+        completion messages.
+
+        Fix: rate-limit the polite reply to one per chat per minute. If
+        an admin keeps spamming, subsequent unknown commands are silently
+        ignored (still logged) so we never hit the flood threshold.
+        """
         cfg: AppConfig = context.application.bot_data["config"]
         user = update.effective_user
         if user is None or user.id not in cfg.secrets.admin_telegram_ids:
             return  # silently ignore non-admin commands
-        if update.effective_message:
-            await update.effective_message.reply_text(
+        msg = update.effective_message
+        if not msg:
+            return
+        chat_id = msg.chat_id
+        now = time.monotonic()
+        last_replies: dict[int, float] = context.application.bot_data.setdefault(
+            "_unknown_cmd_last_reply", {}
+        )
+        last = last_replies.get(chat_id, 0.0)
+        # 60 s cooldown per chat is way below Telegram's flood threshold,
+        # but still lets the admin discover /help if they typo'd once.
+        if now - last < 60.0:
+            log.debug(
+                "cmd_unknown: suppressed reply to chat %s (cooldown)", chat_id
+            )
+            return
+        last_replies[chat_id] = now
+        try:
+            from telegram.error import RetryAfter
+        except ImportError:
+            RetryAfter = ()  # type: ignore[assignment,misc]
+        try:
+            await msg.reply_text(
                 "Command tidak dikenal. Gunakan /help untuk melihat daftar command."
+            )
+        except RetryAfter as exc:
+            # If we still managed to trip flood control, just log it and
+            # back off — don't propagate, otherwise the error handler will
+            # re-trigger reply_text.
+            log.warning(
+                "cmd_unknown: Telegram flood control hit (retry %ss)",
+                exc.retry_after,
             )
 
     @admin_only
