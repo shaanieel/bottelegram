@@ -129,7 +129,7 @@ def _build_stream_meta(body: dict[str, Any], *, kind: str, season: int | None = 
         "episode": episode,
         # Sertakan domain pilihan dengan beberapa alias supaya semua consumer
         # (webstream_importer, dst.) bisa membaca tanpa peduli alias mana yang
-        # mereka pakai. Tanpa ini, link final di Supabase `films.drive_link`
+        # mereka pakai. Tanpa ini, link final di Supabase `films.video_url`
         # akan jatuh ke `https://player4me.com/embed/<id>` (default embed),
         # bukan `https://<domain>/#<id>` yang user pilih di Drive web.
         "player_domain": player_domain,
