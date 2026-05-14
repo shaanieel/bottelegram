@@ -1,15 +1,11 @@
 """Auto insert uploaded Player4Me videos into ZAEIN webstream catalog.
 
-The Drive web sends TMDB metadata and the selected Player4Me public domain to
-the bot HTTP API. The bot keeps that metadata on the in-memory Job object, then
-after Player4Me upload succeeds this helper inserts one row into the webstream
-Supabase `films` table.
-
-Required env on the RDP bot:
-    SUPABASE_URL or WEBSTREAM_SUPABASE_URL
-    SUPABASE_SERVICE_KEY or WEBSTREAM_SUPABASE_SERVICE_KEY
-
-No browser secret is involved here; this runs only on the RDP/VPS bot.
+Fix penting:
+- Link final sekarang memprioritaskan domain pilihan dari Drive web:
+  https://zaeinstore.qzz.io/#videoId
+- job.embed_url dari Player4Me API tidak dipakai sebagai prioritas karena biasanya berisi:
+  https://player4me.com/embed/videoId
+  dan format itu tidak cocok untuk webstream kamu.
 """
 
 from __future__ import annotations
@@ -77,11 +73,19 @@ def _row_from_job(job: Job, video_id: str) -> dict[str, Any] | None:
     if not title:
         title = "Untitled"
 
-    stream_url = job.embed_url or _public_player_url(video_id, meta)
+    # PENTING:
+    # Domain pilihan dari Drive web harus menang.
+    # Jangan pakai job.embed_url dulu, karena bisa berisi player4me.com/embed/xxxx.
+    stream_url = _public_player_url(video_id, meta) or job.embed_url
     if not stream_url:
-        # Fallback hanya dipakai jika Drive web belum mengirim domain. Normalnya
-        # domain dipilih dari tabel player4me_domains, misalnya zaeinstore.qzz.io.
         stream_url = f"https://player4me.com/embed/{video_id}"
+
+    tier = str(meta.get("tier") or "vip").lower()
+    if tier not in {"vip", "free", "basic"}:
+        tier = "vip"
+    # Web admin biasa menampilkan free sebagai Basic.
+    if tier == "basic":
+        tier = "free"
 
     row: dict[str, Any] = {
         "judul": title,
@@ -89,7 +93,7 @@ def _row_from_job(job: Job, video_id: str) -> dict[str, Any] | None:
         "drive_link": stream_url,
         "tahun": _as_int(tmdb.get("year")),
         "tmdb_id": str(tmdb.get("id") or "") or None,
-        "tier": str(meta.get("tier") or "vip").lower(),
+        "tier": tier,
         "poster_url": tmdb.get("poster_url") or None,
         "backdrop_url": tmdb.get("backdrop_url") or None,
         "overview": tmdb.get("overview") or None,
@@ -102,11 +106,6 @@ def _row_from_job(job: Job, video_id: str) -> dict[str, Any] | None:
 
 
 async def maybe_insert_webstream(bot_app: Any, job: Job, video_id: str, progress: ProgressFn) -> None:
-    """Insert uploaded item into Supabase films if stream_meta + env are present.
-
-    This helper intentionally does not raise fatal exceptions. Upload success
-    should remain success even if catalog insert needs manual retry.
-    """
     row = _row_from_job(job, video_id)
     if not row:
         return
