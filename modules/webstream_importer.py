@@ -1,11 +1,23 @@
 """Auto insert uploaded Player4Me videos into ZAEIN webstream catalog.
 
+Kolom di tabel ``public.films`` (Supabase) yang penting:
+
+- ``video_url``    : Player4Me stream URL ``https://<domain>/#<videoId>``.
+                    Diisi oleh bot ini, untuk tier VIP atau Basic/Free.
+- ``drive_link``   : path Drive Index manual (mis. ``/14:/Movie/file.mkv``).
+                    Hanya diisi admin web ketika user pilih VIP dan ingin
+                    expose tombol download/external player. **Tidak boleh
+                    diisi otomatis** oleh bot, karena link Player4Me bukan
+                    path Drive Index dan akan menyembunyikan kolom "Drive
+                    Index Path" di admin web.
+- ``tier``         : ``vip`` atau ``free`` (Basic ditampilkan sebagai Free).
+
 Fix penting:
 - Link final sekarang memprioritaskan domain pilihan dari Drive web:
-  https://zaeinstore.qzz.io/#videoId
-- job.embed_url dari Player4Me API tidak dipakai sebagai prioritas karena biasanya berisi:
-  https://player4me.com/embed/videoId
-  dan format itu tidak cocok untuk webstream kamu.
+  ``https://zaeinstore.qzz.io/#videoId`` (lihat ``_public_player_url``).
+- ``job.embed_url`` dari Player4Me API tidak dipakai sebagai prioritas karena
+  biasanya berisi ``https://player4me.com/embed/<id>`` dan format itu tidak
+  cocok untuk webstream.
 """
 
 from __future__ import annotations
@@ -87,10 +99,16 @@ def _row_from_job(job: Job, video_id: str) -> dict[str, Any] | None:
     if tier == "basic":
         tier = "free"
 
+    # Player4Me stream URL HARUS masuk ke ``video_url``. Sebelumnya kita
+    # tulis ke ``drive_link`` yang sebenarnya kolom untuk path Drive Index
+    # manual (mis. ``/14:/Movie/file.mkv``) yang hanya diisi admin web.
+    # Akibatnya admin web menampilkan link Player4Me di field "Drive Index
+    # Path" alih-alih "Video URL", dan field Video URL yang asli kosong
+    # — jadi player tidak punya source.
     row: dict[str, Any] = {
         "judul": title,
         "tipe": tipe,
-        "drive_link": stream_url,
+        "video_url": stream_url,
         "tahun": _as_int(tmdb.get("year")),
         "tmdb_id": str(tmdb.get("id") or "") or None,
         "tier": tier,
@@ -149,7 +167,7 @@ async def maybe_insert_webstream(bot_app: Any, job: Job, video_id: str, progress
                     row_id = data[0].get("id")
                 await bot_app.queue._update(
                     job,
-                    embed_url=row.get("drive_link"),
+                    embed_url=row.get("video_url"),
                     progress_text=(
                         f"Player4Me selesai + masuk webstream"
                         + (f" (film_id={row_id})" if row_id else "")
