@@ -54,11 +54,19 @@ def _human_title(raw: str) -> str:
     return stem.replace("_", " ").strip() or "Untitled"
 
 
+def _clean_tier(value: Any) -> str:
+    tier = str(value or "vip").lower().strip()
+    return "free" if tier == "free" else "vip"
+
+
 def _job_to_dict(job: Job) -> dict[str, Any]:
+    meta = getattr(job, "stream_meta", None) or {}
+    tmdb = meta.get("tmdb") or {}
     return {
         "id": job.job_id,
         "type": job.type,
-        "title": job.title,
+        "kind": meta.get("kind") or ("series" if meta.get("season") else "movie"),
+        "title": tmdb.get("title") or job.title,
         "source_url": job.source_url,
         "status": job.status,
         "stage": job.progress_text or job.status,
@@ -75,7 +83,43 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
         "gdrive_file_id": job.gdrive_file_id,
         "gdrive_web_link": job.gdrive_web_link,
         "embed_url": job.embed_url,
+        "poster_url": tmdb.get("poster_url") or meta.get("poster_url") or "",
+        "season": meta.get("season") or "",
+        "episode": meta.get("episode") or "",
+        "tier": meta.get("tier") or "",
+        "tmdb": tmdb,
     }
+
+
+def _build_stream_meta(body: dict[str, Any], *, kind: str, season: int | None = None, episode: int | None = None) -> dict[str, Any]:
+    tmdb = body.get("tmdb") or {}
+    title = str(tmdb.get("title") or body.get("title") or "").strip()
+    return {
+        "kind": kind,
+        "target": str(body.get("target") or "player4me").lower().strip(),
+        "tier": _clean_tier(body.get("tier")),
+        "season": season,
+        "episode": episode,
+        "tmdb": {
+            "id": tmdb.get("id"),
+            "type": tmdb.get("type") or ("tv" if kind == "series" else "movie"),
+            "title": title,
+            "year": tmdb.get("year"),
+            "poster_url": tmdb.get("poster_url"),
+            "backdrop_url": tmdb.get("backdrop_url"),
+            "overview": tmdb.get("overview"),
+            "genre": tmdb.get("genre"),
+            "trailer_url": tmdb.get("trailer_url"),
+        },
+    }
+
+
+async def _attach_stream_meta(queue, job: Job, meta: dict[str, Any]) -> None:
+    # Job dataclass is intentionally left backward-compatible. Dynamic attrs are
+    # enough for jobs that are immediately processed, and progress API can return
+    # poster/season/episode without waiting for a schema migration.
+    setattr(job, "stream_meta", meta)
+    await queue._notify(job)
 
 
 class BotHttpApi:
@@ -203,6 +247,7 @@ class BotHttpApi:
             source_url=url,
             requested_by="drive-web",
         )
+        await _attach_stream_meta(self.bot_app.queue, job, _build_stream_meta(body, kind="movie"))
         return _json({"ok": True, "job": _job_to_dict(job)})
 
     async def create_series_jobs(self, request: web.Request) -> web.Response:
@@ -245,6 +290,11 @@ class BotHttpApi:
                 title=title,
                 source_url=_drive_file_url(file_id),
                 requested_by="drive-web",
+            )
+            await _attach_stream_meta(
+                self.bot_app.queue,
+                job,
+                _build_stream_meta(body, kind="series", season=season, episode=ep_no),
             )
             created.append(_job_to_dict(job))
 
